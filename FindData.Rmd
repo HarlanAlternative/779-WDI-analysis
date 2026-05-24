@@ -1,0 +1,78 @@
+---
+title: "FindData"
+author: "Haoran Li"
+date: "2026-03-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Introduction
+
+The dataset used for this project is obtained from the World Bank World Development Indicators (WDI) database. The WDI database provides internationally comparable statistics on economic development, financial markets, and global trade. The data are collected from national statistical agencies, international organizations, and other official sources.
+
+The dataset contains macroeconomic and financial indicators across countries and years. Each observation represents a country-year combination.
+
+# Data source
+
+The data were downloaded from the World Bank DataBank:
+
+World Bank. World Development Indicators.
+https://databank.worldbank.org/source/world-development-indicators
+
+The dataset contains more than 50 observations, as it includes multiple countries over multiple years.
+Data retrieved on: 02/24/2026
+
+you can use the dataset in this way(I thinks this can show the version.The data on website are selective):
+```{r}
+library(WDI)
+
+data <- WDI(
+  country = "all",
+  indicator = c(
+    credit = "FS.AST.PRVT.GD.ZS",
+    gdp_growth = "NY.GDP.MKTP.KD.ZG",
+    gdp_pc = "NY.GDP.PCAP.CD",
+    investment = "NE.GDI.TOTL.ZS",
+    inflation = "FP.CPI.TOTL.ZG",
+    market_cap = "CM.MKT.LCAP.GD.ZS",
+    trade = "NE.TRD.GNFS.ZS",
+    unemployment = "SL.UEM.TOTL.ZS"
+  )
+)
+```
+
+
+
+## Associated Journal Article
+
+Dollar, D., & Kraay, A. (2002). Growth is Good for the Poor.
+Journal of Economic Growth, 7(3), 195–225.
+https://doi.org/10.1023/A:1020139631000
+
+This paper uses cross-country macroeconomic data from the World Bank, including indicators such as GDP, trade, and economic growth. These variables are also included in the World Development Indicators (WDI) dataset used in this project.
+
+The dataset used in this project is obtained from the World Bank's World Development Indicators (WDI).
+
+The variables included in this dataset, such as GDP, trade, and inflation, are widely used in empirical economic research. For example, Dollar and Kraay (2002) use cross-country macroeconomic data from the World Bank to study the relationship between economic growth and poverty.
+
+# Variables
+
+The dataset includes the following variables:
+
+Domestic credit to private sector (% of GDP) – measures financial development and access to credit.
+
+GDP growth (annual %) – measures the annual growth rate of economic output.
+
+GDP per capita (current US$) – represents the average economic output per person.
+
+Gross capital formation (% of GDP) – measures investment in the economy.
+
+Inflation, consumer prices (annual %) – measures changes in the price level.
+
+Market capitalization of listed domestic companies (% of GDP) – represents the size of the stock market relative to the economy.
+
+Trade (% of GDP) – measures the openness of the economy to international trade.
+
+Unemployment (% of labour force) – measures the proportion of the labour force that is unemployed.
