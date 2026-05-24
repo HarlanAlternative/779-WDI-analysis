@@ -4,3 +4,4 @@ CLAUDE.md
 .Rhistory
 .RData
 .httr-oauth
+*.rds
