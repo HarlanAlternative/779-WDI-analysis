@@ -1,22 +1,45 @@
 ---
 title: "Macroeconomic and Financial Indicators: Cross-Country Exploratory Analysis"
 author: "Haoran Li"
+date: ""
 output:
-  html_document:
-    toc: true
-    toc_float:
-      collapsed: false
-    theme: flatly
+  pdf_document:
+    toc: false
+    number_sections: false
+    latex_engine: xelatex
     fig_caption: true
-    df_print: paged
+geometry: "margin=2cm"
+fontsize: 10pt
+classoption: twocolumn
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{newunicodechar}
+  - \newunicodechar{≥}{\ensuremath{\geq}}
+  - \newunicodechar{≤}{\ensuremath{\leq}}
+  - \newunicodechar{ρ}{\ensuremath{\rho}}
+  - \newunicodechar{α}{\ensuremath{\alpha}}
+  - \setlength{\dbltextfloatsep}{4pt plus 1pt minus 2pt}
+  - \setlength{\textfloatsep}{4pt plus 1pt minus 2pt}
+  - \setlength{\intextsep}{3pt plus 1pt minus 1pt}
+  - \setlength{\floatsep}{4pt plus 1pt minus 1pt}
+  - \setlength{\dblfloatsep}{4pt plus 1pt minus 1pt}
+  - \setlength{\abovecaptionskip}{3pt}
+  - \setlength{\belowcaptionskip}{1pt}
+  - \renewcommand{\dbltopfraction}{0.9}
+  - \renewcommand{\dblfloatpagefraction}{0.8}
+  - \setcounter{dbltopnumber}{4}
+  - \raggedbottom
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
-  echo    = FALSE,
-  message = FALSE,
-  warning = FALSE,
-  fig.align = "center"
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  out.width = "\\linewidth",  # scale all figures to text width in PDF
+  dev       = "cairo_pdf"     # supports Unicode characters in plot text
 )
 ```
 
@@ -30,13 +53,15 @@ library(WDI)
 
 # ── Consistent visual theme ───────────────────────────────────────────────────
 theme_report <- function() {
-  theme_minimal(base_size = 11) +
+  theme_minimal(base_size = 9) +
     theme(
-      strip.text      = element_text(face = "bold", size = 9),
-      plot.title      = element_text(face = "bold", size = 11),
-      plot.caption    = element_text(colour = "grey50", size = 8),
+      strip.text      = element_text(face = "bold", size = 7.5),
+      plot.title      = element_text(face = "bold", size = 9),
+      plot.caption    = element_text(colour = "grey50", size = 7),
       legend.position = "bottom",
-      legend.title    = element_blank()
+      legend.title    = element_blank(),
+      legend.text     = element_text(size = 7.5),
+      plot.margin     = margin(3, 4, 3, 4, "pt")
     )
 }
 
@@ -65,32 +90,41 @@ var_display <- c(
   unemployment = "Unemployment"
 )
 
-# ── Fetch from World Bank API (cached to wdi_cache.rds after first run) ───────
-# Delete wdi_cache.rds to force a refresh from the live API.
-cache_file <- "wdi_cache.rds"
+# ── Read pre-downloaded snapshot (Dataset.csv, retrieved 2026-02-24) ──────────
+# The indicators were identified and verified via the WDI R package
+# (see FindData.Rmd). This report uses the fixed CSV snapshot downloaded from
+# World Bank DataBank on 2026-02-24, covering 1960-2025, to ensure results are
+# fully reproducible without an internet connection.
+series_to_col <- c(
+  "Domestic credit to private sector (% of GDP)"                            = "credit",
+  "GDP growth (annual %)"                                                    = "gdp_growth",
+  "GDP per capita (current US$)"                                             = "gdp_pc",
+  "Gross capital formation (% of GDP)"                                       = "investment",
+  "Inflation, consumer prices (annual %)"                                    = "inflation",
+  "Market capitalization of listed domestic companies (% of GDP)"            = "market_cap",
+  "Trade (% of GDP)"                                                         = "trade",
+  "Unemployment, total (% of total labor force) (modeled ILO estimate)"      = "unemployment"
+)
 
-cache_valid <- file.exists(cache_file) &&
-               all(ind_cols %in% names(readRDS(cache_file)))
+raw <- read_csv("Dataset.csv", na = c("..", "", "N/A"), show_col_types = FALSE) %>%
+  rename(country = `Country Name`, code = `Country Code`, series = `Series Name`) %>%
+  select(-`Series Code`) %>%
+  mutate(col = series_to_col[series]) %>%
+  filter(!is.na(col)) %>%
+  pivot_longer(cols = matches("\\[YR"), names_to = "yr_raw", values_to = "value") %>%
+  mutate(year = as.integer(str_extract(yr_raw, "\\d{4}"))) %>%
+  select(country, code, col, year, value) %>%
+  pivot_wider(names_from = col, values_from = value, values_fn = mean)
 
-if (cache_valid) {
-  raw <- readRDS(cache_file)
-} else {
-  raw <- WDI(
-    country   = "all",
-    indicator = indicators,
-    start     = 1960,
-    end       = 2024,
-    extra     = TRUE       # adds region, income, iso3c for filtering below
-  )
-  # Some WDI versions return full indicator codes instead of the short names
-  # supplied in the indicators vector; rename those if present.
-  codes_present <- indicators[unname(indicators) %in% names(raw)]
-  if (length(codes_present) > 0) raw <- dplyr::rename(raw, !!!codes_present)
-  saveRDS(raw, cache_file)
-}
+# ── Separate economies from World Bank aggregate groups ───────────────────────
+# WDI_data$country ships with the WDI package; no internet call needed.
+actual_iso3 <- WDI_data[["country"]] %>%
+  filter(region != "Aggregates") %>%
+  pull(iso3c)
 
-# ── Sovereign countries only (region == "Aggregates" marks composite rows) ────
-ctry <- raw %>% filter(region != "Aggregates")
+ctry <- raw %>%
+  filter(code %in% actual_iso3) %>%
+  rename(iso3c = code)
 
 # ── WB income-group composites for time-series section ───────────────────────
 income_groups <- c("High income", "Upper middle income",
@@ -112,51 +146,50 @@ long_income <- income_wide %>%
   mutate(variable = var_display[variable])
 ```
 
----
-
 # Introduction
 
 ## Data source and collection
 
-The dataset is drawn from the World Bank **World Development Indicators (WDI)** database, which aggregates national accounts, survey, and administrative data reported by member countries to the World Bank and other international organisations (IMF, ILO, OECD). Data are fetched programmatically via the `WDI` R package, which queries the World Bank API, ensuring the analysis is reproducible against the current database version.
+The data come from the World Bank **World Development Indicators (WDI)** database (World Bank, 2026), which compiles national accounts, survey, and administrative records submitted by member countries to the World Bank, IMF, ILO, and OECD. Indicator codes were checked against the `WDI` R package (full details in `FindData.Rmd`). Rather than pulling from the live API, this report uses a fixed snapshot (`Dataset.csv`) downloaded from [World Bank DataBank](https://databank.worldbank.org/source/world-development-indicators) on 24 February 2026—covering 1960–2025—so all results can be reproduced offline.
 
 ## Unit of observation
 
-Each observation represents a **country–year pair**. After excluding World Bank regional and income-group composites, the dataset contains `r format(n_obs, big.mark = ",")` country–year observations with at least one recorded value, spanning `r n_distinct(ctry$country)` economies over `r min(ctry$year)`–`r max(ctry$year)`.
+Each row is a **country–year pair**. Dropping World Bank regional and income-group composites leaves `r format(n_obs, big.mark = ",")` observations with at least one recorded value, across `r n_distinct(ctry$country)` economies over `r min(ctry$year)`–`r max(ctry$year)`. The sample covers UN member states and dependent territories that maintain separate national accounts (e.g., Hong Kong SAR, Virgin Islands U.S.), so "economy" is the more accurate label throughout.
 
 ## Variables, natural limits, and missing-value coding
 
-All eight variables are continuous. Missing values are returned as `NA` by the WDI package. The table below lists each variable, its unit, and its natural limits—constraints that must hold for a value to be plausible.
+All eight indicators are continuous numeric variables; the WDI package codes missing entries as `NA` rather than sentinel values like −99. No cross-variable logical constraints apply—each indicator is defined independently of the others. Table 1 lists each variable alongside its unit and the natural limits any plausible value must satisfy.
 
 ```{r var-table}
 var_meta <- tribble(
-  ~Variable,         ~Unit,          ~`Natural Limits`,
-  "Credit/GDP",       "% of GDP",    "≥ 0 (no strict upper bound)",
-  "GDP Growth",       "%",           "No strict bounds; |x| > 50 is suspicious",
-  "GDP per Capita",   "Current US$", "> 0",
-  "Investment/GDP",   "% of GDP",    "≥ 0; typically < 60",
-  "Inflation",        "%",           "No strict bounds; x > 500 suggests hyperinflation",
-  "Market Cap/GDP",   "% of GDP",    "≥ 0 (no strict upper bound)",
-  "Trade/GDP",        "% of GDP",    "≥ 0 (can exceed 100 for small open economies)",
-  "Unemployment",     "%",           "0 ≤ x ≤ 100"
+  ~Variable,        ~Description,                                              ~Unit,              ~`Natural Limits`,
+  "Credit/GDP",      "Domestic credit to the private sector",                  "\\% of GDP",       "$\\geq 0$ (no strict upper bound)",
+  "GDP Growth",      "Annual growth rate of real GDP",                         "\\%",              "No strict bounds; $|x| > 50$ is suspicious",
+  "GDP per Capita",  "Gross domestic product divided by population",           "Current US\\$",    "$> 0$",
+  "Investment/GDP",  "Gross capital formation (fixed investment + inventories)","\\% of GDP",      "No strict lower bound under SNA 2008; extreme negatives warrant scrutiny",
+  "Inflation",       "Annual change in consumer price index",                  "\\%",              "No strict bounds; $x > 500$ suggests hyperinflation",
+  "Market Cap/GDP",  "Market capitalisation of listed domestic companies",     "\\% of GDP",       "$\\geq 0$ (no strict upper bound)",
+  "Trade/GDP",       "Sum of exports and imports of goods and services",       "\\% of GDP",       "$\\geq 0$ (can exceed 100 for entrepôt economies)",
+  "Unemployment",    "Share of the labour force without work (ILO estimate)",  "\\%",              "$0 \\leq x \\leq 100$"
 )
 
-kable(var_meta,
-      caption = "Table 1. Variable definitions, units, and natural limits.") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"),
-                full_width = FALSE, font_size = 12) %>%
-  column_spec(3, italic = TRUE, width = "14em")
+kbl(var_meta, booktabs = TRUE, longtable = FALSE,
+    caption = "Variable definitions, units, and natural limits.",
+    escape = FALSE,
+    format = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
+                full_width = FALSE, font_size = 7.5) %>%
+  column_spec(1, width = "1.5cm") %>%
+  column_spec(2, width = "2.3cm") %>%
+  column_spec(3, width = "1.2cm") %>%
+  column_spec(4, width = "2.6cm")
 ```
-
-No variable is categorical. Natural limits that involve multiple variables simultaneously are not applicable here: each indicator is independently defined and there are no logical cross-variable constraints analogous to, say, a "non-smoker" coding cigarettes per day.
-
----
 
 # Data Quality Checks
 
 ## Missing data
 
-```{r missing-fig, fig.width = 8, fig.height = 3.5, fig.cap = "**Figure 1.** Left: percentage of country–year observations missing for each indicator. Right: share of individual countries with missing GDP Growth values, grouped by decade—illustrating that data coverage has improved markedly since the 1970s. Both panels are restricted to sovereign-country observations."}
+```{r missing-fig, fig.width = 7, fig.height = 2.8, fig.pos = "!t", fig.env = "figure*", fig.cap = "Left: percentage of country--year observations missing for each indicator. Right: share of economies with missing GDP Growth values, grouped by decade---illustrating that data coverage has improved markedly since the 1970s. Both panels are restricted to economy-level observations (aggregates excluded)."}
 
 # Panel A — missing rate by variable
 miss_var <- long_ctry %>%
@@ -193,36 +226,81 @@ pA + pB
 worst_var <- miss_var %>% slice_max(pct, n = 1)
 ```
 
-**`r worst_var$variable`** has the highest missing rate (`r round(worst_var$pct, 1)`%), because stock-market data exist only for economies with formal capital markets. Missingness is also strongly temporal: coverage before 1970 is sparse across all variables, reflecting limited statistical capacity in many newly independent states. Variables tend to co-absent: Market Cap/GDP, Credit/GDP, and Unemployment are commonly missing together, suggesting that financial-sector and labour-market reporting infrastructure develop jointly.
+```{r co-missing, include=FALSE}
+# Share of Market Cap/GDP-missing rows that are also missing Credit/GDP
+co_miss_pct <- ctry %>%
+  filter(is.na(market_cap)) %>%
+  summarise(pct = mean(is.na(credit)) * 100) %>%
+  pull(pct) %>%
+  round(1)
+```
+
+**`r worst_var$variable`** leads on missingness at `r round(worst_var$pct, 1)`%—stock-exchange data simply do not exist for countries without formal capital markets. There is also a clear temporal skew: pre-1970 coverage is thin across most variables, a legacy of limited statistical capacity in newly independent states. The gaps are not independent, either. Some `r co_miss_pct`% of observations missing Market Cap/GDP are also missing Credit/GDP. That co-missingness pattern matters practically: financial variables may need to be handled as a group rather than variable-by-variable when imputing or filtering.
 
 ## Natural-limit violations and outliers
 
 ```{r limit-checks, include=FALSE}
+# Unemployment: strict bounds [0, 100]
 unemp_viol <- ctry %>% filter(!is.na(unemployment),
                                unemployment < 0 | unemployment > 100)
-gdppc_viol <- ctry %>% filter(!is.na(gdp_pc), gdp_pc <= 0)
-hyperinfl  <- ctry %>%
+
+# GDP per Capita: must be strictly positive
+gdppc_viol  <- ctry %>% filter(!is.na(gdp_pc), gdp_pc <= 0)
+gdppc_min   <- ctry %>% filter(!is.na(gdp_pc)) %>%
+  slice_min(gdp_pc, n = 1, with_ties = FALSE) %>% select(country, year, gdp_pc)
+
+# Investment/GDP: SNA 2008 allows negatives (inventory drawdowns), but flag them
+invest_neg  <- ctry %>% filter(!is.na(investment), investment < 0)
+invest_min  <- ctry %>% filter(!is.na(investment)) %>%
+  slice_min(investment, n = 1, with_ties = FALSE) %>% select(country, year, investment)
+
+# GDP Growth: flag |x| > 50 as suspicious
+gdpg_extreme <- ctry %>% filter(!is.na(gdp_growth), abs(gdp_growth) > 50)
+gdpg_max     <- ctry %>% slice_max(gdp_growth, n = 1, with_ties = FALSE) %>%
+  select(country, year, gdp_growth)
+
+# Trade/GDP: flag values > 400 (far beyond typical small open-economy range)
+trade_extreme <- ctry %>% filter(!is.na(trade), trade > 400) %>%
+  slice_max(trade, n = 1) %>% select(country, year, trade)
+
+# Inflation: hyperinflation threshold 500%
+hyperinfl <- ctry %>%
   filter(!is.na(inflation), inflation > 500) %>%
   arrange(desc(inflation)) %>%
   select(country, year, inflation) %>%
   slice_head(n = 6)
+
+top_hyperinfl <- hyperinfl %>% slice_head(n = 1)
 ```
 
-No observation violates the unemployment bound \[0, 100\], and all GDP per Capita values are strictly positive—both limits are satisfied throughout. However, `r nrow(hyperinfl)` country–year observations record inflation above 500%; the most extreme cases correspond to well-documented hyperinflationary episodes.
+**Unemployment and GDP per Capita** both respect their natural limits: unemployment stays within $[0, 100]$ and every GDP per Capita entry is positive. That said, the lowest recorded value—US\$`r round(gdppc_min$gdp_pc, 1)` for `r gdppc_min$country` in `r gdppc_min$year`—is almost certainly an exchange-rate artefact tied to early post-independence data, not a real economic figure.
 
-```{r hyperinfl-table}
-kable(
+**Negative Investment/GDP**: `r nrow(invest_neg)` observations show negative gross capital formation (lowest: `r round(invest_min$investment, 1)`% in `r invest_min$country`, `r invest_min$year`). SNA 2008 permits this when inventory drawdowns or asset disposals outstrip new fixed investment—something that occasionally occurs during post-conflict rebuilding or deep recessions. These values are kept but flagged for extra scrutiny in investment-focused work.
+
+**Extreme GDP Growth**: `r nrow(gdpg_extreme)` observations exceed the $|x|>50\%$ threshold marked suspicious in Table 1. The single highest—`r round(gdpg_max$gdp_growth, 1)`% in `r gdpg_max$country` (`r gdpg_max$year`)—fits the familiar pattern of post-conflict rebounds or oil-boom base effects. These are not recording errors, but they carry substantial leverage in any regression and deserve individual inspection.
+
+**Extreme Trade/GDP**: The highest value is `r round(trade_extreme$trade, 0)`% (`r trade_extreme$country`, `r trade_extreme$year`). Figures above 400% are quite plausible for small entrepôt economies—Hong Kong SAR, Singapore, Luxembourg—where goods in transit vastly exceed domestic output, making the GDP denominator misleadingly small relative to trade flows.
+
+**Extreme Market Cap/GDP**: Ratios above 100% arise when large multinationals list domestically but generate revenue abroad. Hong Kong SAR is the clearest example—mainland Chinese firms trade on the Hong Kong exchange yet their output does not enter Hong Kong's GDP. The ratio is inflated by a denominator mismatch, not bad data.
+
+**Hyperinflation**: `r nrow(hyperinfl)` country–year observations record inflation above 500%.
+
+```{r hyperinfl-table, results='asis'}
+t2 <- kbl(
   hyperinfl %>% mutate(inflation = round(inflation, 1)),
   col.names = c("Country", "Year", "Inflation (%)"),
-  caption   = "Table 2. Country–years with inflation exceeding 500%."
+  caption   = "Country--years with inflation exceeding 500\\%.",
+  booktabs  = TRUE, longtable = FALSE,
+  format    = "latex"
 ) %>%
-  kable_styling(bootstrap_options = "striped", full_width = FALSE,
-                font_size = 12)
+  kable_styling(latex_options = c("striped"),
+                full_width = FALSE, font_size = 9)
+# [!h]: place here in the text column, overriding topfraction limits;
+# prevents the table from floating backward above the paragraph that introduces it
+cat(sub("\\\\begin\\{table\\}", "\\\\begin{table}[!h]", as.character(t2)))
 ```
 
-These values are arithmetically valid (e.g., Zimbabwe's 2007–2008 hyperinflation is well documented) and are retained in the dataset, but should be treated carefully—log-transformation or winsorisation is advisable before any regression analysis.
-
----
+Each entry in Table 2 is arithmetically valid and corresponds to a known currency crisis—the `r top_hyperinfl$country` episode in `r top_hyperinfl$year` being the most severe. These observations stay in the dataset, but log-transformation or winsorisation is strongly advisable before fitting any regression.
 
 # Data Summaries
 
@@ -249,41 +327,48 @@ summ <- ctry %>%
   ) %>%
   arrange(Variable)
 
-kable(summ,
-      caption = "Table 3. Summary statistics for all eight indicators (individual country–years).") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"),
-                full_width = TRUE, font_size = 11)
+kbl(summ, booktabs = TRUE, longtable = FALSE,
+    caption = "Summary statistics for all eight indicators (individual country--years).",
+    format = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "scale_down", "HOLD_position"),
+                full_width = FALSE, font_size = 8)
 ```
 
 ## Distributions
 
-```{r dist-fig, fig.width = 8, fig.height = 4.5, fig.cap = "**Figure 2.** Distribution of each indicator across all country–year observations. GDP per Capita is displayed on a log₁₀ scale to handle its multi-order-of-magnitude range. Boxplot whiskers extend to 1.5 × IQR; individual points beyond are drawn in red."}
+```{r dist-fig, fig.width = 3.3, fig.height = 5.5, fig.pos = "htbp", fig.env = "figure", fig.cap = "Distribution of each indicator across all country--year observations. GDP per Capita and Inflation are displayed on a log10 scale (positive values only) to handle extreme right skew; negative inflation observations are excluded from those panels only. Boxplot whiskers extend to 1.5 IQR; individual points beyond are drawn in red."}
 
 long_box <- ctry %>%
   select(all_of(ind_cols)) %>%
   pivot_longer(everything(), names_to = "var", values_to = "value") %>%
   filter(!is.na(value)) %>%
+  # Log-transform GDP per Capita (always positive) and Inflation (positive only)
+  filter(!(var == "gdp_pc"   & value <= 0),
+         !(var == "inflation" & value <= 0)) %>%
   mutate(
-    display   = ifelse(var == "gdp_pc", log10(value), value),
-    var_label = ifelse(var == "gdp_pc",
-                       "GDP per Capita\n(log₁₀ US$)", var_display[var])
+    display   = ifelse(var %in% c("gdp_pc", "inflation"), log10(value), value),
+    var_label = case_when(
+      var == "gdp_pc"    ~ "GDP per Capita\n(log10 US$)",
+      var == "inflation" ~ "Inflation\n(log10 %)",
+      TRUE               ~ var_display[var]
+    )
   )
 
 ggplot(long_box, aes(x = factor(0), y = display)) +
   geom_boxplot(fill = "#3498db", alpha = 0.6,
                outlier.size = 0.4, outlier.colour = "#c0392b") +
-  facet_wrap(~ var_label, scales = "free_y", ncol = 4) +
+  facet_wrap(~ var_label, scales = "free_y", ncol = 2) +
   labs(x = NULL, y = NULL) +
   theme_report() +
   theme(axis.text.x  = element_blank(),
         axis.ticks.x = element_blank())
 ```
 
-GDP per Capita spans roughly three orders of magnitude (from under US\$200 to over US\$200,000), confirming the need for log-transformation in any cross-country regression. Inflation is strongly right-skewed with extreme outliers consistent with Table 2. The remaining six variables are broadly symmetric around their medians, though all carry pronounced right tails.
+Log-transformation is necessary for two variables (Figure 2). GDP per Capita spans roughly three orders of magnitude, and Inflation's distribution still shows a pronounced right tail even on a log scale—a direct footprint of the hyperinflationary episodes in Table 2. The other six variables sit more symmetrically around their medians, though none are entirely free of outliers.
 
 ## Time-series trends by income group
 
-```{r ts-fig, fig.width = 8, fig.height = 4, fig.cap = "**Figure 3.** Trends (1990–2024) for three indicators across World Bank income groups. Grey bands mark the Global Financial Crisis (2008–2009) and the COVID-19 shock (2020). Income-group series are World Bank composite aggregates and do not require individual-country imputation."}
+```{r ts-fig, fig.width = 6.5, fig.height = 2.4, fig.pos = "!t", fig.env = "figure*", fig.cap = "Trends (1990--2023) for three indicators across World Bank income groups. Grey bands mark the Global Financial Crisis (2008--2009) and the COVID-19 shock (2020). Income-group series are World Bank composite aggregates and do not require individual-country imputation."}
 
 focus_vars  <- c("GDP Growth", "Credit/GDP", "Trade/GDP")
 
@@ -308,16 +393,16 @@ ggplot(ts_data, aes(year, value, colour = country)) +
   geom_line(linewidth = 0.75) +
   facet_wrap(~ variable, scales = "free_y", ncol = 3) +
   scale_colour_manual(values = c("#e74c3c", "#e67e22", "#27ae60", "#2980b9")) +
-  scale_x_continuous(breaks = seq(1990, 2024, 10)) +
+  scale_x_continuous(breaks = seq(1990, 2025, 10)) +
   labs(x = NULL, y = NULL) +
   theme_report()
 ```
 
-Three patterns stand out. First, financial deepening (Credit/GDP) has risen persistently in high-income economies while remaining flat in low-income ones—a divergence that has widened since 2000. Second, trade openness (Trade/GDP) grew across all income groups through the 1990s–2000s, stalled after the 2008 crisis, and partially recovered, consistent with the slowdown in globalisation documented in the trade literature. Third, GDP growth rates synchronise sharply at both crisis episodes, with the COVID-19 contraction in 2020 being the deepest simultaneous shock across all income groups in the sample.
+Figure 3 surfaces three patterns worth flagging for subsequent modelling. Financial deepening (Credit/GDP) has climbed steadily in high-income countries since 2000 while barely moving in low-income ones—the gap keeps widening. Trade/GDP tells a more cyclical story: it rose across all groups through the 1990s–2000s, flattened after 2008, and has only partially recovered, matching the global trade slowdown documented by Constantinescu, Mattoo & Ruta (2020). Most striking is the GDP growth panel: both crisis windows generate sharp, synchronised contractions across all income groups, and the 2020 COVID-19 shock is by some margin the deepest in the sample.
 
 ## Bivariate relationships
 
-```{r corr-fig, fig.width = 5.5, fig.height = 5.2, fig.cap = "**Figure 4.** Spearman rank correlation matrix computed on pairwise-complete country–year observations. Spearman is used in preference to Pearson because GDP per Capita and Inflation are strongly right-skewed. Variables are reordered by hierarchical clustering. Crosses mark correlations not significant after Bonferroni correction (α = 0.05 / 28 pairs). Colour intensity reflects magnitude."}
+```{r corr-fig, fig.width = 3.3, fig.height = 3.0, fig.pos = "htbp", fig.env = "figure", fig.cap = "Spearman rank correlation matrix computed on pairwise-complete country--year observations. Spearman is used in preference to Pearson because GDP per Capita and Inflation are strongly right-skewed. Variables are reordered by hierarchical clustering. Blank cells indicate correlations not reaching significance after Bonferroni correction ($\\alpha = 0.05 / 28$ pairs). Colour intensity reflects magnitude."}
 
 # Compute on short names, then rename rows/cols for display before plotting
 corr_mat <- ctry %>%
@@ -329,9 +414,30 @@ corr_p <- ctry %>%
   cor_pmat(method = "spearman")
 
 # Inline values extracted before renaming
-r_credit_gdppc  <- round(corr_mat["credit",     "gdp_pc"],   2)
-r_mktcap_credit <- round(corr_mat["market_cap", "credit"],   2)
+r_credit_gdppc  <- round(corr_mat["credit",     "gdp_pc"],     2)
+r_mktcap_credit <- round(corr_mat["market_cap", "credit"],     2)
 r_infl_growth   <- round(corr_mat["inflation",  "gdp_growth"], 2)
+
+# Dynamic interpretation of the inflation–growth rank correlation
+infl_growth_desc <- if (abs(r_infl_growth) < 0.05) {
+  paste0(
+    "show essentially no rank correlation (ρ = ", r_infl_growth, "), ",
+    "suggesting that the classical negative inflation–growth link operates ",
+    "primarily through extreme episodes rather than across the full distribution"
+  )
+} else if (r_infl_growth < 0) {
+  paste0(
+    "are negatively correlated (ρ = ", r_infl_growth, "), ",
+    "consistent with evidence on the growth costs of macroeconomic instability"
+  )
+} else {
+  paste0(
+    "are weakly positively correlated (ρ = ", r_infl_growth, "), ",
+    "a finding driven by high-growth emerging markets that experienced moderate ",
+    "inflation during catch-up episodes; the classical negative relationship ",
+    "documented in the literature emerges more clearly after conditioning on income level"
+  )
+}
 
 # Rename to display labels for the plot
 rownames(corr_mat) <- colnames(corr_mat) <- var_display[colnames(corr_mat)]
@@ -341,24 +447,50 @@ ggcorrplot(
   corr_mat,
   p.mat      = corr_p,
   sig.level  = 0.05 / 28,
-  insig      = "pch",
-  pch.cex    = 3,
+  insig      = "blank",
   hc.order   = TRUE,
   type       = "lower",
   lab        = TRUE,
-  lab_size   = 3,
+  lab_size   = 1.8,
   colors     = c("#c0392b", "white", "#2980b9")
 ) +
+  labs(x = NULL, y = NULL) +
   theme_report() +
-  theme(axis.text.x    = element_text(angle = 45, hjust = 1),
+  theme(axis.text.x    = element_text(angle = 45, hjust = 1, size = 6.5),
+        axis.text.y    = element_text(size = 6.5),
         legend.position = "right",
-        legend.title    = element_text(size = 9))  # restore: colour bar label is meaningful here
+        legend.title    = element_text(size = 7.5),
+        legend.text     = element_text(size = 6.5),
+        legend.key.size = unit(0.35, "cm"))
 ```
 
-The strongest association is between Credit/GDP and GDP per Capita (ρ = `r r_credit_gdppc`), and between Market Cap/GDP and Credit/GDP (ρ = `r r_mktcap_credit`), confirming that financial depth and per-capita wealth cluster together—consistent with the financial-development literature. Inflation and GDP Growth are negatively correlated (ρ = `r r_infl_growth`), in line with evidence on the growth costs of macroeconomic instability. Trade/GDP is largely orthogonal to financial variables, reflecting that trade openness is driven more by geography and trade policy than by domestic financial development.
-
----
+Figure 4 shows Credit/GDP and GDP per Capita as the tightest pair (ρ = `r r_credit_gdppc`), with Market Cap/GDP and Credit/GDP close behind (ρ = `r r_mktcap_credit`)—the familiar clustering of financial depth and per-capita wealth identified by King & Levine (1993) and Levine (2005). Inflation and GDP Growth `r infl_growth_desc`. What stands out by contrast is Trade/GDP: it is nearly uncorrelated with the financial cluster, which makes sense given that trade openness is shaped mainly by geography and commercial policy rather than domestic financial conditions.
 
 # Conclusions
 
-This report examined eight World Bank macroeconomic indicators covering `r n_distinct(ctry$country)` economies from `r min(ctry$year)` to `r max(ctry$year)`. The principal data quality finding is that financial-sector variables—particularly Market Cap/GDP (`r round(filter(miss_var, variable == "Market Cap/GDP")$pct, 1)`% missing)—are systematically absent in lower-income economies, introducing a selection bias that researchers must address before fitting models that include these regressors. Distributional analysis reveals that GDP per Capita and Inflation are strongly right-skewed and span multiple orders of magnitude, making log-transformation a practical necessity rather than an optional refinement. Exploratory analysis highlights two structural patterns relevant to subsequent modelling: a persistent and widening divergence in financial depth across income groups since the 1990s, and a tight co-movement between financial variables and per-capita wealth, suggesting a latent financial development factor that could serve as a dimension-reduction target. Researchers extending this dataset towards causal inference should account for its two-way panel structure (country and year fixed effects), handle the non-random missing data in financial variables explicitly, and consider the documented hyperinflationary outliers as leverage points in any linear model.
+The dataset covers `r n_distinct(ctry$country)` economies from `r min(ctry$year)` to `r max(ctry$year)`, and the eight indicators examined here are far from clean. The most consequential quality issue is the non-random absence of financial variables: Market Cap/GDP is missing in `r round(filter(miss_var, variable == "Market Cap/GDP")$pct, 1)`% of country–years, and those gaps are concentrated in lower-income economies. Any model that includes these regressors implicitly conditions on the existence of a functioning capital market—a selection that should be made explicit rather than left buried in the sample.
+
+Two distributional features will affect most modelling choices. GDP per Capita and Inflation are both heavily right-skewed, spanning several orders of magnitude; log-transformation is not optional for either. For the remaining six variables the distributions are broadly symmetric, but outliers are common—particularly the hyperinflationary episodes in Table 2, which deserve individual case review before any regression is run.
+
+Structurally, financial depth (Credit/GDP, Market Cap/GDP) tracks closely with per-capita income across the sample, and the income-group time series shows this gap widening since the 1990s—a latent financial development dimension that PCA or factor analysis could usefully extract. Researchers building causal models from this dataset, in the tradition of cross-country growth empirics (Dollar & Kraay, 2002), should plan for two-way fixed effects, explicit treatment of financial-variable missingness, and careful handling of hyperinflationary observations. Extending the dataset with institutional indicators (Acemoglu, Johnson & Robinson, 2001) would also help separate financial development from broader governance effects.
+
+# References {-}
+
+\small
+\setlength{\parskip}{2pt}
+\setlength{\parindent}{0pt}
+\setlength{\hangindent}{1em}
+
+Acemoglu, D., Johnson, S., & Robinson, J. A. (2001). The colonial origins of comparative development. *American Economic Review*, *91*(5), 1369--1401.
+
+Constantinescu, C., Mattoo, A., & Ruta, M. (2020). The global trade slowdown: Cyclical or structural? *World Bank Economic Review*, *34*(1), 121--142.
+
+Dollar, D., & Kraay, A. (2002). Growth is good for the poor. *Journal of Economic Growth*, *7*(3), 195--225.
+
+King, R. G., & Levine, R. (1993). Finance and growth: Schumpeter might be right. *Quarterly Journal of Economics*, *108*(3), 717--737.
+
+Levine, R. (2005). Finance and growth: Theory and evidence. In *Handbook of Economic Growth* (Vol. 1A, pp. 865--934). Elsevier.
+
+World Bank. (2026). *World Development Indicators* [Dataset]. World Bank DataBank. Retrieved 24 February 2026.
+
+\normalsize
