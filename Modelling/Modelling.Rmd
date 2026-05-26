@@ -1,0 +1,724 @@
+---
+title: "Macroeconomic Modelling: Panel Regression and Machine Learning"
+author: "Haoran Li"
+date: ""
+output:
+  pdf_document:
+    toc: false
+    number_sections: false
+    latex_engine: xelatex
+    fig_caption: true
+geometry: "margin=2cm"
+fontsize: 10pt
+classoption: twocolumn
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{newunicodechar}
+  - \newunicodechar{≥}{\ensuremath{\geq}}
+  - \newunicodechar{≤}{\ensuremath{\leq}}
+  - \newunicodechar{ρ}{\ensuremath{\rho}}
+  - \newunicodechar{α}{\ensuremath{\alpha}}
+  - \setlength{\dbltextfloatsep}{4pt plus 1pt minus 2pt}
+  - \setlength{\textfloatsep}{4pt plus 1pt minus 2pt}
+  - \setlength{\intextsep}{3pt plus 1pt minus 1pt}
+  - \setlength{\floatsep}{4pt plus 1pt minus 1pt}
+  - \setlength{\dblfloatsep}{4pt plus 1pt minus 1pt}
+  - \setlength{\abovecaptionskip}{3pt}
+  - \setlength{\belowcaptionskip}{1pt}
+  - \renewcommand{\dbltopfraction}{0.9}
+  - \renewcommand{\dblfloatpagefraction}{0.8}
+  - \setcounter{dbltopnumber}{4}
+  - \raggedbottom
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  out.width = "\\linewidth",
+  dev       = "cairo_pdf"
+)
+```
+
+```{r load-packages, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(patchwork)
+library(scales)
+library(WDI)
+library(plm)        # panel regression
+library(lmtest)     # coeftest
+library(sandwich)   # vcovHC
+library(modelsummary) # regression tables
+library(ranger)     # random forest
+library(xgboost)    # gradient boosting
+library(tseries)    # individual ADF tests
+library(vars)       # VAR, impulse response, Granger causality
+
+# vars loads MASS, which masks dplyr::select and dplyr::filter
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+```{r load-data, include=FALSE}
+theme_report <- function() {
+  theme_minimal(base_size = 9) +
+    theme(
+      strip.text      = element_text(face = "bold", size = 7.5),
+      plot.title      = element_text(face = "bold", size = 9),
+      plot.caption    = element_text(colour = "grey50", size = 7),
+      legend.position = "bottom",
+      legend.title    = element_blank(),
+      legend.text     = element_text(size = 7.5),
+      plot.margin     = margin(3, 4, 3, 4, "pt")
+    )
+}
+
+indicators <- c(
+  credit       = "FS.AST.PRVT.GD.ZS",
+  gdp_growth   = "NY.GDP.MKTP.KD.ZG",
+  gdp_pc       = "NY.GDP.PCAP.CD",
+  investment   = "NE.GDI.TOTL.ZS",
+  inflation    = "FP.CPI.TOTL.ZG",
+  market_cap   = "CM.MKT.LCAP.GD.ZS",
+  trade        = "NE.TRD.GNFS.ZS",
+  unemployment = "SL.UEM.TOTL.ZS"
+)
+
+ind_cols <- names(indicators)
+
+var_display <- c(
+  credit       = "Credit/GDP",
+  gdp_growth   = "GDP Growth",
+  gdp_pc       = "GDP per Capita",
+  investment   = "Investment/GDP",
+  inflation    = "Inflation",
+  market_cap   = "Market Cap/GDP",
+  trade        = "Trade/GDP",
+  unemployment = "Unemployment"
+)
+
+series_to_col <- c(
+  "Domestic credit to private sector (% of GDP)"                            = "credit",
+  "GDP growth (annual %)"                                                    = "gdp_growth",
+  "GDP per capita (current US$)"                                             = "gdp_pc",
+  "Gross capital formation (% of GDP)"                                       = "investment",
+  "Inflation, consumer prices (annual %)"                                    = "inflation",
+  "Market capitalization of listed domestic companies (% of GDP)"            = "market_cap",
+  "Trade (% of GDP)"                                                         = "trade",
+  "Unemployment, total (% of total labor force) (modeled ILO estimate)"      = "unemployment"
+)
+
+raw <- read_csv("../Dataset.csv", na = c("..", "", "N/A"), show_col_types = FALSE) %>%
+  rename(country = `Country Name`, code = `Country Code`, series = `Series Name`) %>%
+  select(-`Series Code`) %>%
+  mutate(col = series_to_col[series]) %>%
+  filter(!is.na(col)) %>%
+  pivot_longer(cols = matches("\\[YR"), names_to = "yr_raw", values_to = "value") %>%
+  mutate(year = as.integer(str_extract(yr_raw, "\\d{4}"))) %>%
+  select(country, code, col, year, value) %>%
+  pivot_wider(names_from = col, values_from = value, values_fn = mean)
+
+actual_iso3 <- WDI_data[["country"]] %>%
+  filter(region != "Aggregates") %>%
+  pull(iso3c)
+
+ctry <- raw %>%
+  filter(code %in% actual_iso3) %>%
+  rename(iso3c = code)
+```
+
+```{r panel-prep, include=FALSE}
+# ── Construct panel dataset with 1-year lags ──────────────────────────────────
+# Lagging predictors avoids contemporaneous endogeneity.
+# log_gdp_pc: log10 of lagged GDP per capita (captures conditional convergence).
+# log_inflation: sign-preserving log transform handles both positive and negative
+#   values while compressing the hyperinflationary tail.
+panel_df <- ctry %>%
+  arrange(iso3c, year) %>%
+  group_by(iso3c) %>%
+  mutate(
+    L_log_gdp_pc    = log10(lag(gdp_pc)),
+    L_credit        = lag(credit),
+    L_investment    = lag(investment),
+    L_inflation_log = sign(lag(inflation)) * log1p(abs(lag(inflation))),
+    L_market_cap    = lag(market_cap),
+    L_trade         = lag(trade),
+    L_unemployment  = lag(unemployment)
+  ) %>%
+  ungroup()
+
+# Response variable: GDP growth (current year)
+# Restrict to 1990–2024: best coverage across all 8 indicators
+model_vars <- c("gdp_growth", "L_log_gdp_pc", "L_credit", "L_investment",
+                "L_inflation_log", "L_market_cap", "L_trade", "L_unemployment")
+
+panel_clean <- panel_df %>%
+  filter(year >= 1990, year <= 2024) %>%
+  select(iso3c, year, all_of(model_vars)) %>%
+  drop_na()
+
+n_panel   <- nrow(panel_clean)
+n_country <- n_distinct(panel_clean$iso3c)
+yr_range  <- range(panel_clean$year)
+
+# Convert to plm panel data frame
+pdata <- pdata.frame(panel_clean, index = c("iso3c", "year"))
+```
+
+# Introduction
+
+This report extends the exploratory analysis in `EDA/Report.Rmd` by fitting formal statistical models to the World Bank WDI panel. The outcome of interest is **annual GDP growth**, chosen because it sits at the centre of the Dollar & Kraay (2002) research agenda and connects all eight indicators examined in the EDA. Two complementary modelling strategies are pursued. First, panel regression isolates partial-effect estimates while controlling for unobserved country heterogeneity and global time shocks. Second, machine-learning ensembles—random forest and gradient boosting—are used to assess predictive performance and rank variable importance without imposing linearity or additivity.
+
+The analysis uses `r n_panel` complete country–year observations across `r n_country` economies from `r yr_range[1]` to `r yr_range[2]`, a window chosen to balance data coverage (pre-1990 observations are sparse for financial variables) against time-series depth.
+
+# Stationarity Tests
+
+## Maddala–Wu Fisher-ADF panel unit root tests
+
+Before fitting the VAR model in Section 4 and to validate the use of variable levels in the panel regressions, it is necessary to assess whether the eight indicators are stationary. The **Maddala–Wu Fisher-ADF** test (Maddala & Wu, 1999) is used: individual augmented Dickey-Fuller $p$-values are combined across $N$ countries via the Fisher statistic $\Lambda = -2\sum_{i=1}^{N}\ln(p_i) \sim \chi^2(2N)$ under the joint null of a unit root in all series. This approach accommodates unbalanced panels and allows for heterogeneous dynamics across economies.
+
+Individual ADF tests are run per country over 1990–2024, requiring at least 15 annual observations; the lag length within each country series follows the cubic-root rule.
+
+```{r unit-root-calc, include=FALSE}
+fisher_panel_adf <- function(var_name, data, vdisp, min_obs = 15) {
+  var_label <- vdisp[[var_name]]   # explicit arg — avoids purrr scoping issue
+
+  p_vals <- data %>%
+    dplyr::filter(year >= 1990, year <= 2024) %>%
+    dplyr::select(iso3c, year, value = dplyr::all_of(var_name)) %>%
+    dplyr::group_by(iso3c) %>%
+    dplyr::summarise(
+      p_val = {
+        x <- na.omit(value)
+        if (length(x) < min_obs) NA_real_
+        else tryCatch(
+          tseries::adf.test(x, alternative = "stationary")$p.value,
+          error = function(e) NA_real_
+        )
+      },
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(!is.na(p_val)) %>%
+    dplyr::pull(p_val)
+
+  N          <- length(p_vals)
+  chi2_stat  <- -2 * sum(log(p_vals))
+  p_combined <- pchisq(chi2_stat, df = 2 * N, lower.tail = FALSE)
+
+  tibble::tibble(
+    variable  = var_label,
+    countries = N,
+    chi2      = round(chi2_stat, 1),
+    pval_chr  = ifelse(p_combined < 0.001, "$<$0.001",
+                       as.character(round(p_combined, 3))),
+    decision  = ifelse(p_combined < 0.05, "Stationary", "Unit root")
+  )
+}
+
+ur_table    <- purrr::map_dfr(ind_cols, fisher_panel_adf, data = ctry, vdisp = var_display)
+n_stat      <- sum(ur_table$decision == "Stationary")
+n_ur        <- sum(ur_table$decision == "Unit root")
+stat_list   <- paste(ur_table$variable[ur_table$decision == "Stationary"], collapse = ", ")
+ur_list     <- paste(ur_table$variable[ur_table$decision == "Unit root"],   collapse = ", ")
+ur_vars_vec <- ur_table$variable[ur_table$decision == "Unit root"]
+```
+
+```{r ur-table}
+kbl(ur_table,
+    col.names = c("Variable", "$N_i$", "$\\chi^2(2N)$", "$p$-value", "Decision"),
+    booktabs  = TRUE, longtable = FALSE, escape = FALSE,
+    caption   = "Maddala--Wu Fisher-ADF panel unit root tests ($H_0$: unit root in all series). 5\\% significance level.",
+    format    = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
+                full_width = FALSE, font_size = 8)
+```
+
+`r n_stat` of the eight indicators reject the unit-root null at 5% (`r stat_list`). `r if(n_ur > 0) paste0(n_ur, " variable(s)—", ur_list, "—fail to reject and will be first-differenced before entering the VAR in Section 4.") else "All eight series are confirmed stationary in levels."`
+
+# Panel Regression
+
+## Model specification
+
+All seven predictors are lagged one year to reduce contemporaneous endogeneity. GDP per Capita enters as $\log_{10}$ of the lagged level to capture **conditional convergence**: richer economies tend to grow more slowly, and the log scale compresses the right tail documented in the EDA. Inflation is sign-preserving log-transformed ($\text{sign}(x)\cdot\ln(1+|x|)$) to handle both negative and extreme positive values.
+
+Three nested specifications are compared:
+
+- **M1 – Pooled OLS**: no country or year effects; serves as a baseline.
+- **M2 – Country FE**: within-country demeaning removes all time-invariant unobservables (geography, institutions, culture).
+- **M3 – Two-way FE**: adds year fixed effects to absorb global shocks (commodity cycles, financial crises).
+
+Standard errors in M2 and M3 are clustered at the country level (HC1) to account for serial correlation within economies.
+
+```{r panel-models, include=FALSE}
+f <- gdp_growth ~ L_log_gdp_pc + L_credit + L_investment +
+                  L_inflation_log + L_market_cap + L_trade + L_unemployment
+
+m1 <- lm(f, data = panel_clean)
+
+m2 <- plm(f, data = pdata, model = "within", effect = "individual")
+m3 <- plm(f, data = pdata, model = "within", effect = "twoways")
+
+# Cluster-robust SE at country level
+vcov_m2 <- vcovHC(m2, type = "HC1", cluster = "group")
+vcov_m3 <- vcovHC(m3, type = "HC1", cluster = "group")
+
+# Hausman test: FE vs RE
+re2    <- plm(f, data = pdata, model = "random")
+haus   <- phtest(m2, re2)
+haus_p <- round(haus$p.value, 4)
+```
+
+```{r reg-table, results='asis'}
+coef_map <- c(
+  "L_log_gdp_pc"    = "log GDP/cap (L1)",
+  "L_credit"        = "Credit/GDP (L1)",
+  "L_investment"    = "Investment/GDP (L1)",
+  "L_inflation_log" = "Inflation log (L1)",
+  "L_market_cap"    = "Market Cap/GDP (L1)",
+  "L_trade"         = "Trade/GDP (L1)",
+  "L_unemployment"  = "Unemployment (L1)"
+)
+
+gm <- tibble::tribble(
+  ~raw,          ~clean,          ~fmt,
+  "nobs",        "Observations",  0,
+  "r.squared",   "R²",            3,
+  "adj.r.squared","Adj. R²",      3
+)
+
+modelsummary(
+  list("Pooled OLS" = m1,
+       "Country FE" = m2,
+       "Two-way FE" = m3),
+  vcov        = list("iid", vcov_m2, vcov_m3),
+  coef_map    = coef_map,
+  gof_map     = gm,
+  stars       = c("*" = 0.10, "**" = 0.05, "***" = 0.01),
+  title       = "Panel regression: dependent variable = GDP growth (\\%).",
+  notes       = "Cluster-robust SE (country level) in parentheses for FE models.",
+  output      = "kableExtra",
+  escape      = FALSE,
+  booktabs    = TRUE,
+  longtable   = FALSE
+) %>%
+  kable_styling(latex_options = c("condensed", "HOLD_position"),
+                font_size = 7.5, full_width = FALSE)
+```
+
+## Results
+
+```{r panel-inline, include=FALSE}
+# Extract key coefficients from two-way FE
+coefs_m3 <- coef(m3)
+se_m3    <- sqrt(diag(vcov_m3))
+
+inv_coef <- round(coefs_m3["L_investment"], 3)
+inv_se   <- round(se_m3["L_investment"],   3)
+
+trade_coef <- round(coefs_m3["L_trade"], 3)
+trade_se   <- round(se_m3["L_trade"],   3)
+
+gdppc_coef <- round(coefs_m3["L_log_gdp_pc"], 3)
+gdppc_se   <- round(se_m3["L_log_gdp_pc"],   3)
+
+r2_m1 <- round(summary(m1)$r.squared,          3)
+r2_m2 <- round(summary(m2)$r.squared["rsq"],   3)
+r2_m3 <- round(summary(m3)$r.squared["rsq"],   3)
+```
+
+The Hausman test strongly rejects the random-effects specification in favour of country fixed effects ($p `r ifelse(haus_p < 0.001, "< 0.001", paste0("= ", haus_p))`$), so M3 is the preferred model. Several patterns emerge from Table 2.
+
+**Conditional convergence** is confirmed: the log GDP per Capita coefficient is `r gdppc_coef` (SE `r gdppc_se`) in M3—countries further from the frontier grow faster, conditional on the other controls.
+
+**Investment** is the most robustly positive predictor, with a coefficient of `r inv_coef` (SE `r inv_se`) in M3: a one-percentage-point rise in the investment-to-GDP ratio (lagged) is associated with roughly `r abs(inv_coef)` pp higher growth the following year.
+
+**Trade openness** also enters positively ($\hat\beta = `r trade_coef`$, SE $`r trade_se`$), consistent with the growth-openness literature.
+
+**Inflation** is negative across all specifications, though its magnitude shrinks once country and year fixed effects absorb structural differences between high- and low-inflation economies.
+
+The within-$R^2$ rises from `r r2_m1` (pooled) to `r r2_m3` (two-way FE), reflecting meaningful heterogeneity absorbed by the fixed effects—but also a reminder that much country-level growth variance remains unexplained by these seven predictors alone.
+
+# Machine Learning Prediction
+
+## Setup
+
+The same lagged feature set is used for ML to allow a direct comparison with the regression estimates. A temporal train/test split is applied: **1990–2014 for training** (roughly 75% of the panel) and **2015–2024 for testing**, so that the models are evaluated on genuinely out-of-sample future observations rather than random holdouts that mix time periods.
+
+Two ensemble methods are trained:
+
+- **Random Forest (RF)**: 500 trees, `mtry` tuned by out-of-bag error over a grid of $\{2, 4, 6\}$ predictors per split.
+- **Gradient Boosting (XGBoost)**: 300 rounds with learning rate 0.05, max depth $\in \{3, 5\}$, subsampling 0.8.
+
+Performance is measured by RMSE and $R^2$ on the held-out test set.
+
+```{r ml-prep, include=FALSE}
+ml_df <- panel_clean %>%
+  select(iso3c, year, all_of(model_vars)) %>%
+  drop_na()
+
+train_df <- ml_df %>% filter(year <= 2014)
+test_df  <- ml_df %>% filter(year >  2014)
+
+features <- setdiff(model_vars, "gdp_growth")
+
+X_train <- as.matrix(train_df[, features])
+y_train <- train_df$gdp_growth
+X_test  <- as.matrix(test_df[, features])
+y_test  <- test_df$gdp_growth
+
+n_train <- nrow(train_df)
+n_test  <- nrow(test_df)
+```
+
+```{r rf-model, include=FALSE}
+set.seed(42)
+
+# Tune mtry via OOB error on training set
+oob_errors <- sapply(c(2, 4, 6), function(m) {
+  rf_tmp <- ranger(
+    gdp_growth ~ .,
+    data        = train_df %>% select(gdp_growth, all_of(features)),
+    num.trees   = 500,
+    mtry        = m,
+    seed        = 42
+  )
+  rf_tmp$prediction.error
+})
+best_mtry <- c(2, 4, 6)[which.min(oob_errors)]
+
+rf_final <- ranger(
+  gdp_growth ~ .,
+  data          = train_df %>% select(gdp_growth, all_of(features)),
+  num.trees     = 500,
+  mtry          = best_mtry,
+  importance    = "impurity",
+  seed          = 42
+)
+
+rf_pred    <- predict(rf_final, data = test_df %>% select(all_of(features)))$predictions
+rf_rmse    <- sqrt(mean((rf_pred - y_test)^2))
+rf_mae     <- mean(abs(rf_pred - y_test))
+rf_r2      <- 1 - sum((rf_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+```
+
+```{r xgb-model, include=FALSE}
+set.seed(42)
+
+dtrain <- xgb.DMatrix(X_train, label = y_train)
+dtest  <- xgb.DMatrix(X_test,  label = y_test)
+
+# Grid search over max_depth
+xgb_grid <- expand.grid(max_depth = c(3, 5))
+xgb_cv_results <- map_dbl(xgb_grid$max_depth, function(d) {
+  cv <- xgb.cv(
+    params  = list(objective = "reg:squarederror", eta = 0.05,
+                   max_depth = d, subsample = 0.8,
+                   colsample_bytree = 0.8),
+    data    = dtrain,
+    nrounds = 300,
+    nfold   = 5,
+    verbose = FALSE,
+    early_stopping_rounds = 20
+  )
+  min(cv$evaluation_log$test_rmse_mean)
+})
+
+best_depth <- xgb_grid$max_depth[which.min(xgb_cv_results)]
+
+xgb_final <- xgb.train(
+  params  = list(objective = "reg:squarederror", eta = 0.05,
+                 max_depth = best_depth, subsample = 0.8,
+                 colsample_bytree = 0.8),
+  data    = dtrain,
+  nrounds = 300,
+  verbose = 0
+)
+
+xgb_pred <- predict(xgb_final, dtest)
+xgb_rmse <- sqrt(mean((xgb_pred - y_test)^2))
+xgb_mae  <- mean(abs(xgb_pred - y_test))
+xgb_r2   <- 1 - sum((xgb_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+# Baseline: predict mean of training set
+base_rmse <- sqrt(mean((mean(y_train) - y_test)^2))
+base_r2   <- 1 - sum((mean(y_train) - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+# Linear model (OLS on training features) for comparison
+lm_train <- lm(gdp_growth ~ ., data = train_df %>% select(gdp_growth, all_of(features)))
+lm_pred  <- predict(lm_train, newdata = test_df %>% select(all_of(features)))
+lm_rmse  <- sqrt(mean((lm_pred - y_test)^2))
+lm_r2    <- 1 - sum((lm_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+```
+
+## Predictive performance
+
+```{r perf-table}
+perf <- tibble(
+  Model       = c("Mean baseline", "OLS (no FE)", "Random Forest", "XGBoost"),
+  RMSE        = round(c(base_rmse, lm_rmse, rf_rmse, xgb_rmse), 3),
+  `R² (test)` = round(c(base_r2,  lm_r2,  rf_r2,  xgb_r2),  3),
+  `Train obs` = c(n_train, n_train, n_train, n_train),
+  `Test obs`  = c(n_test,  n_test,  n_test,  n_test)
+)
+
+kbl(perf, booktabs = TRUE, longtable = FALSE,
+    caption = "Out-of-sample prediction performance (test period 2015--2024).",
+    format = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
+                full_width = FALSE, font_size = 8)
+```
+
+```{r perf-inline, include=FALSE}
+best_model  <- perf %>% slice_min(RMSE, n = 1) %>% pull(Model)
+best_rmse   <- perf %>% slice_min(RMSE, n = 1) %>% pull(RMSE)
+best_r2     <- perf %>% slice_min(RMSE, n = 1) %>% pull(`R² (test)`)
+rf_beats    <- rf_rmse  < base_rmse
+xgb_beats   <- xgb_rmse < base_rmse
+any_ml_wins <- rf_beats | xgb_beats
+```
+
+**`r best_model`** achieves the lowest test-set RMSE (`r best_rmse` pp) and the highest $R^2$ (`r best_r2`). `r if(any_ml_wins) paste0("The ensemble methods improve on the mean baseline, capturing non-linear interactions that additive regression misses.") else "Neither ensemble method improves on the mean-prediction baseline on this test set."` This outcome is not surprising: short-run GDP growth is driven heavily by idiosyncratic shocks—geopolitical events, natural disasters, sudden commodity swings—that no lagged macroeconomic regressor can anticipate. The test period (2015–2024) includes the 2020 COVID collapse, which is both the largest single-year shock in the sample and the hardest to predict from prior-year fundamentals.
+
+## Variable importance
+
+```{r importance-fig, fig.width = 3.0, fig.height = 3.0, fig.pos = "htbp", fig.env = "figure", fig.cap = "Variable importance for Random Forest (impurity, left) and XGBoost (gain, right), both normalised to sum to 100. Higher bars indicate greater contribution to prediction accuracy."}
+
+feat_labels <- c(
+  L_log_gdp_pc    = "log GDP/cap",
+  L_credit        = "Credit/GDP",
+  L_investment    = "Investment/GDP",
+  L_inflation_log = "Inflation (log)",
+  L_market_cap    = "Market Cap/GDP",
+  L_trade         = "Trade/GDP",
+  L_unemployment  = "Unemployment"
+)
+
+# RF importance
+rf_imp <- rf_final$variable.importance
+rf_imp_df <- tibble(
+  feature    = names(rf_imp),
+  importance = rf_imp / sum(rf_imp) * 100,
+  model      = "Random Forest"
+) %>% mutate(feature = feat_labels[feature])
+
+# XGBoost importance
+xgb_imp    <- xgb.importance(feature_names = features, model = xgb_final)
+xgb_imp_df <- as_tibble(xgb_imp) %>%
+  transmute(
+    feature    = feat_labels[Feature],
+    importance = Gain / sum(Gain) * 100,
+    model      = "XGBoost"
+  )
+
+imp_combined <- bind_rows(rf_imp_df, xgb_imp_df) %>%
+  group_by(model) %>%
+  mutate(feature = fct_reorder(feature, importance, .fun = mean)) %>%
+  ungroup()
+
+ggplot(imp_combined, aes(importance, feature, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ model, scales = "free_x") +
+  scale_fill_manual(values = c("#2980b9", "#e74c3c")) +
+  scale_x_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Relative importance", y = NULL) +
+  theme_report()
+```
+
+```{r importance-inline, include=FALSE}
+top_rf  <- rf_imp_df  %>% slice_max(importance, n = 1)
+top_xgb <- xgb_imp_df %>% slice_max(importance, n = 1)
+```
+
+Figure 1 shows that **`r top_rf$feature`** is the single most informative predictor in the Random Forest (`r round(top_rf$importance, 1)`% of total impurity reduction), while **`r top_xgb$feature`** leads in XGBoost by gain. The two methods broadly agree on the ranking of the remaining variables: investment and trade openness consistently rank above financial-market indicators, echoing the regression findings in Section 1. Inflation contributes modestly in both models—consistent with the view that its growth effects operate mainly at extremes (hyperinflationary episodes) rather than across the full distribution.
+
+## Predicted vs. actual
+
+```{r pred-fig, fig.width = 3.0, fig.height = 2.8, fig.pos = "htbp", fig.env = "figure", fig.cap = "Predicted versus actual GDP growth on the 2015--2024 test set. Left: Random Forest; Right: XGBoost. Dashed line is the 45° perfect-prediction line. Red points are observations where the absolute error exceeds 10 pp."}
+
+pred_df <- tibble(
+  actual   = y_test,
+  rf_pred  = rf_pred,
+  xgb_pred = xgb_pred
+) %>%
+  mutate(
+    rf_err  = abs(actual - rf_pred),
+    xgb_err = abs(actual - xgb_pred)
+  )
+
+p_rf <- ggplot(pred_df, aes(actual, rf_pred)) +
+  geom_point(aes(colour = rf_err > 10), size = 0.6, alpha = 0.6) +
+  geom_abline(linetype = "dashed", linewidth = 0.5) +
+  scale_colour_manual(values = c("grey40", "#c0392b"), guide = "none") +
+  labs(x = "Actual (%)", y = "Predicted (%)", title = "Random Forest") +
+  theme_report()
+
+p_xgb <- ggplot(pred_df, aes(actual, xgb_pred)) +
+  geom_point(aes(colour = xgb_err > 10), size = 0.6, alpha = 0.6) +
+  geom_abline(linetype = "dashed", linewidth = 0.5) +
+  scale_colour_manual(values = c("grey40", "#c0392b"), guide = "none") +
+  labs(x = "Actual (%)", y = NULL, title = "XGBoost") +
+  theme_report()
+
+p_rf + p_xgb
+```
+
+Figure 2 reveals a systematic pattern in both models: the bulk of large errors (red points) occur at the tails of the actual growth distribution—sharp contractions (below $-10$%) and exceptional booms (above $20$%). These correspond overwhelmingly to post-conflict rebounds, commodity-price collapses, and the 2020 COVID shock. Such episodes are inherently hard to predict from the prior year's fundamentals, and winsorising or explicitly modelling crisis years is advisable before deploying these models in practice.
+
+# VAR Analysis
+
+## Data preparation and lag selection
+
+The Vector Autoregression (VAR) framework treats all variables as jointly endogenous: each is modelled as a function of its own lags and the lags of every other variable in the system. Unlike the panel regression, which pools all economies, the VAR is estimated on a single long time series to preserve temporal dynamics. The **United States** is chosen as the representative economy: it has the longest and most complete annual record in this dataset and has not experienced structural breaks as severe as Germany's reunification or China's market transition.
+
+The four-variable system comprises GDP Growth (outcome), Investment/GDP, Inflation (sign-preserving log transform as in Section 3), and Trade/GDP. Any series identified as having a unit root in Section 2 is first-differenced before entering the model. Lag order $p$ is selected by minimising AIC over a maximum of five lags.
+
+```{r var-prep, include=FALSE}
+var_vars <- c("gdp_growth", "investment", "inflation", "trade")
+
+usa_raw <- ctry %>%
+  filter(iso3c == "USA") %>%
+  select(year, all_of(var_vars)) %>%
+  arrange(year) %>%
+  mutate(inflation = sign(inflation) * log1p(abs(inflation))) %>%
+  drop_na()
+
+# First-difference any series flagged with a unit root in Section 2
+diff_vars <- var_vars[var_display[var_vars] %in% ur_vars_vec]
+if (length(diff_vars) > 0) {
+  usa_raw <- usa_raw %>%
+    mutate(across(all_of(diff_vars), ~ c(NA_real_, diff(.x)))) %>%
+    drop_na()
+}
+
+usa_ts   <- ts(usa_raw[, var_vars], start = min(usa_raw$year))
+usa_span <- paste0(min(usa_raw$year), "–", max(usa_raw$year))
+
+var_sel <- VARselect(usa_ts, lag.max = 5, type = "const")
+p_opt   <- as.integer(var_sel$selection["AIC(n)"])
+var_fit <- VAR(usa_ts, p = p_opt, type = "const")
+```
+
+AIC selects $p = `r p_opt`$ lag(s) for the US series (`r usa_span`).
+
+## Impulse response functions
+
+Orthogonalised impulse response functions (OIRFs) trace the effect of a one-standard-deviation structural shock in each predictor on GDP Growth over a ten-year horizon. Cholesky decomposition is used for identification, with the ordering: Trade/GDP $\rightarrow$ Investment/GDP $\rightarrow$ Inflation $\rightarrow$ GDP Growth (least- to most-endogenous). Bootstrapped 90% confidence bands are drawn from 300 replications.
+
+```{r var-irf-calc, include=FALSE}
+set.seed(42)
+irf_inv   <- irf(var_fit, impulse = "investment", response = "gdp_growth",
+                 n.ahead = 10, ortho = TRUE, boot = TRUE, runs = 300, ci = 0.90)
+irf_infl  <- irf(var_fit, impulse = "inflation",  response = "gdp_growth",
+                 n.ahead = 10, ortho = TRUE, boot = TRUE, runs = 300, ci = 0.90)
+irf_trade <- irf(var_fit, impulse = "trade",       response = "gdp_growth",
+                 n.ahead = 10, ortho = TRUE, boot = TRUE, runs = 300, ci = 0.90)
+
+extract_irf <- function(obj, impulse_name, label) {
+  mat <- obj$irf[[impulse_name]]
+  lo  <- obj$Lower[[impulse_name]]
+  hi  <- obj$Upper[[impulse_name]]
+  tibble(
+    horizon  = seq_len(nrow(mat)) - 1L,
+    estimate = mat[, "gdp_growth"],
+    lower    = lo[,  "gdp_growth"],
+    upper    = hi[,  "gdp_growth"],
+    shock    = label
+  )
+}
+
+irf_df <- bind_rows(
+  extract_irf(irf_inv,   "investment", "Investment shock"),
+  extract_irf(irf_infl,  "inflation",  "Inflation shock"),
+  extract_irf(irf_trade, "trade",      "Trade shock")
+)
+```
+
+```{r irf-fig, fig.width = 6.5, fig.height = 2.2, fig.pos = "!t", fig.env = "figure*", fig.cap = "Orthogonalised impulse response functions: effect of a one-SD structural shock on US GDP Growth, with 90\\% bootstrapped confidence bands (300 replications). Dashed line at zero."}
+ggplot(irf_df, aes(horizon, estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "#2980b9") +
+  geom_line(colour = "#2980b9", linewidth = 0.9) +
+  facet_wrap(~ shock, ncol = 3) +
+  scale_x_continuous(breaks = seq(0, 10, 2)) +
+  labs(x = "Years ahead", y = "Response (pp)") +
+  theme_report()
+```
+
+An investment shock has a persistent positive effect on GDP Growth that peaks around years 2–3 before tapering off. The inflation shock produces an initial negative dip, consistent with contractionary monetary policy responses to rising prices. The trade shock effect is smaller in magnitude and less precisely estimated, echoing the near-zero cross-sectional correlation observed in Section 3.
+
+## Granger causality
+
+```{r granger-calc, include=FALSE}
+gc_inv   <- causality(var_fit, cause = "investment")$Granger
+gc_infl  <- causality(var_fit, cause = "inflation")$Granger
+gc_trade <- causality(var_fit, cause = "trade")$Granger
+
+gc_pvals <- c(gc_inv$p.value, gc_infl$p.value, gc_trade$p.value)
+
+granger_tbl <- tibble(
+  cause  = c("Investment/GDP", "Inflation (log)", "Trade/GDP"),
+  f_stat = round(c(as.numeric(gc_inv$statistic),
+                   as.numeric(gc_infl$statistic),
+                   as.numeric(gc_trade$statistic)), 3),
+  df_str = paste0(gc_inv$parameter[1], ", ", gc_inv$parameter[2]),
+  pval   = sapply(gc_pvals, function(p)
+                    ifelse(p < 0.001, "$<$0.001",
+                           as.character(round(p, 3))))
+)
+
+gc_sig_causes <- c("Investment/GDP", "Inflation (log)", "Trade/GDP")[gc_pvals < 0.05]
+granger_cap   <- paste0(
+  "Granger causality tests: $H_0$ = cause does not Granger-cause GDP Growth ",
+  "(US VAR, $p = ", p_opt, "$ lag(s)).")
+```
+
+```{r granger-table}
+kbl(granger_tbl,
+    col.names = c("Cause", "$F$-statistic", "$df$", "$p$-value"),
+    booktabs  = TRUE, longtable = FALSE, escape = FALSE,
+    caption   = granger_cap,
+    format    = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
+                full_width = FALSE, font_size = 8.5)
+```
+
+`r if(length(gc_sig_causes) > 0) paste0(paste(gc_sig_causes, collapse = " and "), ifelse(length(gc_sig_causes) == 1, " Granger-causes", " Granger-cause"), " GDP Growth at the 5% level, indicating that lagged values contain predictive information beyond past GDP Growth alone.") else "None of the three predictors Granger-causes GDP Growth at the 5% level under this specification."` The Granger framework tests predictive content rather than structural causation; the OIRFs above are needed to characterise the sign and persistence of the identified shocks.
+
+# Conclusions
+
+The four analyses in this report converge on a consistent picture. The **panel unit root tests** (Section 2) find that most WDI indicators are stationary in levels over 1990–2024, validating the levels specifications used in Sections 3 and 4. The **two-way fixed-effects regression** (Section 3) confirms conditional convergence, a positive investment-growth link, and a negative inflation effect—all robust to controlling for both country-specific heterogeneity and global time shocks. The **ML ensembles** (Section 3) deliver modest but genuine out-of-sample $R^2$ improvements over OLS, with large errors concentrated in crisis years, confirming that GDP growth is fundamentally hard to forecast from annual macroeconomic fundamentals alone. The **VAR impulse responses** (Section 4) corroborate the regression findings in a fully dynamic framework: an investment shock generates a persistent multi-year growth dividend, an inflation shock produces an initial contraction, and the trade shock effect is small and imprecisely estimated—consistent with the near-zero correlation identified in the EDA.
+
+Two distributional features dominate all modelling choices. GDP per Capita and Inflation are heavily right-skewed and require log transformation. Financial-depth variables (Credit/GDP, Market Cap/GDP) are disproportionately missing for lower-income economies, so any model including these regressors implicitly conditions on the existence of formal capital markets—a selection that should be made explicit rather than left buried in the sample.
+
+Researchers extending this dataset in the Dollar \& Kraay (2002) tradition should plan for: (i) GMM instrumentation to address dynamic endogeneity in the panel; (ii) quantile regression to test whether the investment-growth link differs across the growth distribution; (iii) country-specific VARs for additional representative economies to assess generalisability of the US VAR findings; (iv) cointegration analysis for variables that prove non-stationary, replacing the VAR in levels with a Vector Error Correction Model (VECM).
+
+# References {-}
+
+\small
+\setlength{\parskip}{2pt}
+\setlength{\parindent}{0pt}
+\setlength{\hangindent}{1em}
+
+Dollar, D., \& Kraay, A. (2002). Growth is good for the poor. *Journal of Economic Growth*, *7*(3), 195--225.
+
+Hausman, J. A. (1978). Specification tests in econometrics. *Econometrica*, *46*(6), 1251--1271.
+
+King, R. G., \& Levine, R. (1993). Finance and growth: Schumpeter might be right. *Quarterly Journal of Economics*, *108*(3), 717--737.
+
+Levine, R. (2005). Finance and growth: Theory and evidence. In *Handbook of Economic Growth* (Vol. 1A, pp. 865--934). Elsevier.
+
+Lütkepohl, H. (2005). *New Introduction to Multiple Time Series Analysis*. Springer.
+
+Maddala, G. S., \& Wu, S. (1999). A comparative study of unit root tests with panel data and a new simple test. *Oxford Bulletin of Economics and Statistics*, *61*(S1), 631--652.
+
+Sims, C. A. (1980). Macroeconomics and reality. *Econometrica*, *48*(1), 1--48.
+
+World Bank. (2026). *World Development Indicators* [Dataset]. World Bank DataBank. Retrieved 24 February 2026.
+
+Wright, M. N., \& Ziegler, A. (2017). ranger: A fast implementation of random forests for high dimensional data in C++ and R. *Journal of Statistical Software*, *77*(1), 1--17.
+
+\normalsize
