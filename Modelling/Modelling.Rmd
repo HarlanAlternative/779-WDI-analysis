@@ -55,12 +55,17 @@ library(sandwich)   # vcovHC
 library(modelsummary) # regression tables
 library(ranger)     # random forest
 library(xgboost)    # gradient boosting
+library(glmnet)     # Lasso / Ridge / Elastic Net
 library(tseries)    # individual ADF tests
 library(vars)       # VAR, impulse response, Granger causality
 
-# vars loads MASS, which masks dplyr::select and dplyr::filter
+# Later packages (MASS via vars; stats via plm/tseries) mask core dplyr verbs.
+# Re-bind them explicitly so the data pipeline behaves as intended. The lag
+# binding is critical: stats::lag does NOT shift a plain vector, which would
+# silently turn every "lagged" predictor into a contemporaneous one.
 select <- dplyr::select
 filter <- dplyr::filter
+lag    <- dplyr::lag
 ```
 
 ```{r load-data, include=FALSE}
@@ -147,7 +152,8 @@ panel_df <- ctry %>%
     L_inflation_log = sign(lag(inflation)) * log1p(abs(lag(inflation))),
     L_market_cap    = lag(market_cap),
     L_trade         = lag(trade),
-    L_unemployment  = lag(unemployment)
+    L_unemployment  = lag(unemployment),
+    L_gdp_growth    = lag(gdp_growth)   # AR term — used only by the ML models
   ) %>%
   ungroup()
 
@@ -325,6 +331,9 @@ trade_se   <- round(se_m3["L_trade"],   3)
 gdppc_coef <- round(coefs_m3["L_log_gdp_pc"], 3)
 gdppc_se   <- round(se_m3["L_log_gdp_pc"],   3)
 
+credit_coef <- round(coefs_m3["L_credit"], 3)
+credit_se   <- round(se_m3["L_credit"],   3)
+
 r2_m1 <- round(summary(m1)$r.squared,          3)
 r2_m2 <- round(summary(m2)$r.squared["rsq"],   3)
 r2_m3 <- round(summary(m3)$r.squared["rsq"],   3)
@@ -332,156 +341,293 @@ r2_m3 <- round(summary(m3)$r.squared["rsq"],   3)
 
 The Hausman test strongly rejects the random-effects specification in favour of country fixed effects ($p `r ifelse(haus_p < 0.001, "< 0.001", paste0("= ", haus_p))`$), so M3 is the preferred model. Several patterns emerge from Table 2.
 
-**Conditional convergence** is confirmed: the log GDP per Capita coefficient is `r gdppc_coef` (SE `r gdppc_se`) in M3—countries further from the frontier grow faster, conditional on the other controls.
+**Conditional convergence** shows the expected sign: lagged log GDP per Capita is negative in all three specifications (M3: `r gdppc_coef`, SE `r gdppc_se`) and significant in the pooled and country-FE models—poorer economies grow faster, conditional on the controls—though the two-way FE estimate is noisier once common year effects are absorbed.
 
-**Investment** is the most robustly positive predictor, with a coefficient of `r inv_coef` (SE `r inv_se`) in M3: a one-percentage-point rise in the investment-to-GDP ratio (lagged) is associated with roughly `r abs(inv_coef)` pp higher growth the following year.
+**Credit/GDP** is the most robust predictor: negative and significant at the 1% level across all three specifications (M3: `r credit_coef`, SE `r credit_se`). Within a country, faster prior-year credit expansion is associated with slightly *slower* subsequent growth—consistent with the credit-boom-and-bust literature, where rapid leverage growth tends to precede slowdowns.
 
-**Trade openness** also enters positively ($\hat\beta = `r trade_coef`$, SE $`r trade_se`$), consistent with the growth-openness literature.
+**Investment and trade openness** carry their expected positive signs (M3: `r inv_coef` and `r trade_coef` respectively) but lose significance under the demanding two-way FE specification, indicating that their explanatory power is largely *between* economies rather than within them year to year.
 
-**Inflation** is negative across all specifications, though its magnitude shrinks once country and year fixed effects absorb structural differences between high- and low-inflation economies.
+**Inflation** is negative throughout, significant in the pooled and country-FE models, with the effect attenuating once year fixed effects absorb the common inflationary episodes shared across countries.
 
-The within-$R^2$ rises from `r r2_m1` (pooled) to `r r2_m3` (two-way FE), reflecting meaningful heterogeneity absorbed by the fixed effects—but also a reminder that much country-level growth variance remains unexplained by these seven predictors alone.
+The within-$R^2$ is modest throughout (`r r2_m1` pooled, `r r2_m3` two-way FE): even with seven lagged predictors and full fixed-effects controls, the bulk of year-to-year growth variation remains unexplained—a foretaste of the predictive limits laid bare in Section 3.
 
 # Machine Learning Prediction
 
 ## Setup
 
-The same lagged feature set is used for ML to allow a direct comparison with the regression estimates. A temporal train/test split is applied: **1990–2014 for training** (roughly 75% of the panel) and **2015–2024 for testing**, so that the models are evaluated on genuinely out-of-sample future observations rather than random holdouts that mix time periods.
+The ML feature set extends the regression predictors with two refinements that exploit the panel structure. First, a **lagged dependent variable** (previous-year GDP Growth) is added: growth is persistent, and the panel FE regression deliberately omits this term to avoid Nickell bias, but the predictive models face no such restriction. Second, a **within (country-demeaning) transformation** is applied—each variable is expressed as a deviation from its country mean—so that the models learn from within-country year-to-year variation rather than fixed cross-country level differences, the predictive analogue of the fixed effects in Section 3. To prevent look-ahead leakage, country means are computed on the training period only, and the training country-mean growth (the role of the country fixed effect) is added back to predictions so all metrics remain on the original percentage-point scale.
 
-Two ensemble methods are trained:
+A temporal train/test split is used: **1990–2014 for training** and **2015–2024 for testing**, so models are evaluated on genuinely future observations rather than random holdouts that mix time periods. Six predictor models spanning two families are compared:
 
-- **Random Forest (RF)**: 500 trees, `mtry` tuned by out-of-bag error over a grid of $\{2, 4, 6\}$ predictors per split.
-- **Gradient Boosting (XGBoost)**: 300 rounds with learning rate 0.05, max depth $\in \{3, 5\}$, subsampling 0.8.
+- **Regularised linear models** (`glmnet`): **Lasso** ($L_1$), **Ridge** ($L_2$), and **Elastic Net** ($\alpha = 0.5$). With only seven predictors these guard against over-fitting and, in the Lasso case, perform automatic variable selection; $\lambda$ is chosen by time-blocked cross-validation.
+- **Random Forest** (`ranger`): 500 trees, with `mtry` and minimum node size tuned jointly.
+- **Gradient Boosting** (`xgboost`): tree depth, learning rate, and the `gamma` complexity penalty tuned jointly.
 
-Performance is measured by RMSE and $R^2$ on the held-out test set.
+All hyperparameters are selected by **rolling-origin cross-validation** on the training period—each fold trains on years up to an origin and validates on the following two—so no future information leaks into model selection. Performance is measured by RMSE and $R^2$ on the held-out test set, benchmarked against two naive baselines: the global training mean and the country-specific mean (the fixed-effect offset).
 
 ```{r ml-prep, include=FALSE}
-ml_df <- panel_clean %>%
-  select(iso3c, year, all_of(model_vars)) %>%
+# ── Feature set: regression predictors + lagged dependent variable (AR term) ──
+ml_features <- c(setdiff(model_vars, "gdp_growth"), "L_gdp_growth")
+
+ml_df <- panel_df %>%
+  filter(year >= 1990, year <= 2024) %>%
+  select(iso3c, year, gdp_growth, all_of(ml_features)) %>%
   drop_na()
 
-train_df <- ml_df %>% filter(year <= 2014)
-test_df  <- ml_df %>% filter(year >  2014)
+train_raw <- ml_df %>% filter(year <= 2014)
+test_raw  <- ml_df %>% filter(year >  2014) %>%
+  filter(iso3c %in% unique(train_raw$iso3c))   # need training history for the offset
 
-features <- setdiff(model_vars, "gdp_growth")
+# ── Within transformation: subtract TRAINING-period country means (leak-free) ─
+# Demeaning both predictors and the target removes fixed cross-country level
+# differences. The training country-mean growth acts as the country fixed-effect
+# offset and is added back to predictions for original-scale evaluation.
+means_tbl <- train_raw %>%
+  group_by(iso3c) %>%
+  summarise(across(c(gdp_growth, all_of(ml_features)), mean), .groups = "drop")
 
-X_train <- as.matrix(train_df[, features])
-y_train <- train_df$gdp_growth
-X_test  <- as.matrix(test_df[, features])
-y_test  <- test_df$gdp_growth
+demean_join <- function(df) {
+  cols <- c("gdp_growth", ml_features)
+  df   <- as.data.frame(df)
+  mm   <- as.matrix(means_tbl[match(df$iso3c, means_tbl$iso3c), cols])
+  df[cols] <- as.matrix(df[cols]) - mm
+  df[c("iso3c", "year", cols)]
+}
+
+train_df <- demean_join(train_raw)   # demeaned (for model fitting)
+test_df  <- demean_join(test_raw)    # demeaned (for prediction)
+
+# Original-scale target and the per-row country-mean offset for test observations
+y_test  <- test_raw$gdp_growth
+test_fe <- test_raw$gdp_growth - test_df$gdp_growth   # = training country mean
+y_train <- train_df$gdp_growth                        # demeaned target
+
+features <- ml_features
+X_train  <- as.matrix(train_df[, features])
+X_test   <- as.matrix(test_df[, features])
 
 n_train <- nrow(train_df)
 n_test  <- nrow(test_df)
+sst     <- sum((y_test - mean(y_test))^2)   # total SS for R^2 on the test set
+```
+
+```{r cv-setup, include=FALSE}
+# ── Rolling-origin (expanding-window) cross-validation on the training period ──
+# Each fold trains on all years up to an origin and validates on the next two
+# years, so no future information leaks into hyperparameter selection—the proper
+# time-series analogue of k-fold CV. Evaluation is on the demeaned scale (the
+# country-mean offset is a constant within each country and cancels in RMSE).
+cv_origins <- c(2004, 2006, 2008, 2010, 2012)
+cv_folds <- lapply(cv_origins, function(o) {
+  list(tr = which(train_df$year <= o),
+       va = which(train_df$year > o & train_df$year <= o + 2))
+})
+
+cv_rmse <- function(fit_predict) {
+  mean(vapply(cv_folds, function(f) {
+    pr <- fit_predict(train_df[f$tr, , drop = FALSE],
+                      train_df[f$va, , drop = FALSE])
+    sqrt(mean((pr - train_df$gdp_growth[f$va])^2))
+  }, numeric(1)))
+}
 ```
 
 ```{r rf-model, include=FALSE}
 set.seed(42)
 
-# Tune mtry via OOB error on training set
-oob_errors <- sapply(c(2, 4, 6), function(m) {
-  rf_tmp <- ranger(
-    gdp_growth ~ .,
-    data        = train_df %>% select(gdp_growth, all_of(features)),
-    num.trees   = 500,
-    mtry        = m,
-    seed        = 42
-  )
-  rf_tmp$prediction.error
+# Tune mtry x min.node.size by rolling-origin CV
+rf_grid <- expand.grid(mtry = c(2, 3, 4, 6), min.node.size = c(5, 10, 20))
+rf_grid$cv <- apply(rf_grid, 1, function(g) {
+  cv_rmse(function(tr, va) {
+    m <- ranger(gdp_growth ~ ., data = tr[c("gdp_growth", features)],
+                num.trees = 500, mtry = g[["mtry"]],
+                min.node.size = g[["min.node.size"]], seed = 42)
+    predict(m, data = va[features])$predictions
+  })
 })
-best_mtry <- c(2, 4, 6)[which.min(oob_errors)]
+best_rf <- rf_grid[which.min(rf_grid$cv), ]
 
 rf_final <- ranger(
-  gdp_growth ~ .,
-  data          = train_df %>% select(gdp_growth, all_of(features)),
+  gdp_growth ~ ., data = train_df[c("gdp_growth", features)],
   num.trees     = 500,
-  mtry          = best_mtry,
+  mtry          = best_rf$mtry,
+  min.node.size = best_rf$min.node.size,
   importance    = "impurity",
   seed          = 42
 )
 
-rf_pred    <- predict(rf_final, data = test_df %>% select(all_of(features)))$predictions
+# Predictions are on the demeaned scale; add back the country-mean offset
+rf_pred_dm <- predict(rf_final, data = test_df[features])$predictions
+rf_pred    <- rf_pred_dm + test_fe
 rf_rmse    <- sqrt(mean((rf_pred - y_test)^2))
 rf_mae     <- mean(abs(rf_pred - y_test))
-rf_r2      <- 1 - sum((rf_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+rf_r2      <- 1 - sum((rf_pred - y_test)^2) / sst
 ```
 
 ```{r xgb-model, include=FALSE}
 set.seed(42)
 
 dtrain <- xgb.DMatrix(X_train, label = y_train)
-dtest  <- xgb.DMatrix(X_test,  label = y_test)
+dtest  <- xgb.DMatrix(X_test,  label = test_df$gdp_growth)
 
-# Grid search over max_depth
-xgb_grid <- expand.grid(max_depth = c(3, 5))
-xgb_cv_results <- map_dbl(xgb_grid$max_depth, function(d) {
-  cv <- xgb.cv(
-    params  = list(objective = "reg:squarederror", eta = 0.05,
-                   max_depth = d, subsample = 0.8,
-                   colsample_bytree = 0.8),
-    data    = dtrain,
-    nrounds = 300,
-    nfold   = 5,
-    verbose = FALSE,
-    early_stopping_rounds = 20
-  )
-  min(cv$evaluation_log$test_rmse_mean)
+# Tune max_depth x eta x gamma by rolling-origin CV (nrounds fixed at 200)
+xgb_grid <- expand.grid(max_depth = c(2, 3, 5), eta = c(0.03, 0.10), gamma = c(0, 1))
+xgb_grid$cv <- apply(xgb_grid, 1, function(g) {
+  cv_rmse(function(tr, va) {
+    dtr <- xgb.DMatrix(as.matrix(tr[features]), label = tr$gdp_growth)
+    m <- xgb.train(
+      params  = list(objective = "reg:squarederror", eta = g[["eta"]],
+                     max_depth = g[["max_depth"]], gamma = g[["gamma"]],
+                     subsample = 0.8, colsample_bytree = 0.8),
+      data = dtr, nrounds = 200, verbose = 0)
+    predict(m, xgb.DMatrix(as.matrix(va[features])))
+  })
 })
-
-best_depth <- xgb_grid$max_depth[which.min(xgb_cv_results)]
+best_xgb <- xgb_grid[which.min(xgb_grid$cv), ]
 
 xgb_final <- xgb.train(
-  params  = list(objective = "reg:squarederror", eta = 0.05,
-                 max_depth = best_depth, subsample = 0.8,
-                 colsample_bytree = 0.8),
-  data    = dtrain,
-  nrounds = 300,
-  verbose = 0
-)
+  params  = list(objective = "reg:squarederror", eta = best_xgb$eta,
+                 max_depth = best_xgb$max_depth, gamma = best_xgb$gamma,
+                 subsample = 0.8, colsample_bytree = 0.8),
+  data = dtrain, nrounds = 200, verbose = 0)
 
-xgb_pred <- predict(xgb_final, dtest)
-xgb_rmse <- sqrt(mean((xgb_pred - y_test)^2))
-xgb_mae  <- mean(abs(xgb_pred - y_test))
-xgb_r2   <- 1 - sum((xgb_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+xgb_pred_dm <- predict(xgb_final, dtest)
+xgb_pred    <- xgb_pred_dm + test_fe
+xgb_rmse    <- sqrt(mean((xgb_pred - y_test)^2))
+xgb_mae     <- mean(abs(xgb_pred - y_test))
+xgb_r2      <- 1 - sum((xgb_pred - y_test)^2) / sst
+```
 
-# Baseline: predict mean of training set
-base_rmse <- sqrt(mean((mean(y_train) - y_test)^2))
-base_r2   <- 1 - sum((mean(y_train) - y_test)^2) / sum((y_test - mean(y_test))^2)
+```{r glmnet-model, include=FALSE}
+set.seed(42)
+# Time-blocked folds so cv.glmnet selects lambda without shuffling adjacent years
+yr_block <- as.integer(cut(train_df$year, breaks = 5, labels = FALSE))
 
-# Linear model (OLS on training features) for comparison
-lm_train <- lm(gdp_growth ~ ., data = train_df %>% select(gdp_growth, all_of(features)))
-lm_pred  <- predict(lm_train, newdata = test_df %>% select(all_of(features)))
+fit_glmnet <- function(alpha) {
+  cvg <- cv.glmnet(X_train, y_train, alpha = alpha,
+                   foldid = yr_block, standardize = TRUE)
+  pr  <- as.numeric(predict(cvg, newx = X_test, s = "lambda.min")) + test_fe
+  list(rmse = sqrt(mean((pr - y_test)^2)),
+       r2   = 1 - sum((pr - y_test)^2) / sst,
+       cvg  = cvg)
+}
+
+lasso <- fit_glmnet(1)     # L1
+ridge <- fit_glmnet(0)     # L2
+enet  <- fit_glmnet(0.5)   # elastic net
+
+lasso_rmse <- lasso$rmse; lasso_r2 <- lasso$r2
+ridge_rmse <- ridge$rmse; ridge_r2 <- ridge$r2
+enet_rmse  <- enet$rmse;  enet_r2  <- enet$r2
+
+# Non-zero coefficients retained by Lasso (excluding intercept)
+lasso_nz <- sum(as.numeric(coef(lasso$cvg, s = "lambda.min"))[-1] != 0)
+```
+
+```{r baselines, include=FALSE}
+# Baseline 1: global training mean (original scale)
+base_rmse <- sqrt(mean((mean(train_raw$gdp_growth) - y_test)^2))
+base_r2   <- 1 - sum((mean(train_raw$gdp_growth) - y_test)^2) / sst
+
+# Baseline 2: country mean (the fixed-effect offset alone, no predictors)
+cmean_rmse <- sqrt(mean((test_fe - y_test)^2))
+cmean_r2   <- 1 - sum((test_fe - y_test)^2) / sst
+
+# OLS within (linear benchmark on demeaned features) + offset
+lm_train <- lm(gdp_growth ~ ., data = train_df[c("gdp_growth", features)])
+lm_pred  <- predict(lm_train, newdata = test_df[features]) + test_fe
 lm_rmse  <- sqrt(mean((lm_pred - y_test)^2))
-lm_r2    <- 1 - sum((lm_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+lm_r2    <- 1 - sum((lm_pred - y_test)^2) / sst
 ```
 
 ## Predictive performance
 
 ```{r perf-table}
 perf <- tibble(
-  Model       = c("Mean baseline", "OLS (no FE)", "Random Forest", "XGBoost"),
-  RMSE        = round(c(base_rmse, lm_rmse, rf_rmse, xgb_rmse), 3),
-  `R² (test)` = round(c(base_r2,  lm_r2,  rf_r2,  xgb_r2),  3),
-  `Train obs` = c(n_train, n_train, n_train, n_train),
-  `Test obs`  = c(n_test,  n_test,  n_test,  n_test)
+  Model       = c("Global mean", "Country mean (FE)", "OLS within",
+                  "Lasso", "Ridge", "Elastic Net",
+                  "Random Forest", "XGBoost"),
+  RMSE        = round(c(base_rmse, cmean_rmse, lm_rmse,
+                        lasso_rmse, ridge_rmse, enet_rmse,
+                        rf_rmse, xgb_rmse), 3),
+  `R² (test)` = round(c(base_r2, cmean_r2, lm_r2,
+                        lasso_r2, ridge_r2, enet_r2,
+                        rf_r2, xgb_r2), 3),
+  `Train obs` = n_train,
+  `Test obs`  = n_test
 )
 
 kbl(perf, booktabs = TRUE, longtable = FALSE,
-    caption = "Out-of-sample prediction performance (test period 2015--2024).",
+    caption = "Out-of-sample prediction performance (test period 2015--2024). Models below the line use the lagged predictors; hyperparameters are tuned by rolling-origin cross-validation.",
     format = "latex") %>%
   kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
-                full_width = FALSE, font_size = 8)
+                full_width = FALSE, font_size = 7.5) %>%
+  row_spec(2, hline_after = TRUE)
 ```
 
 ```{r perf-inline, include=FALSE}
-best_model  <- perf %>% slice_min(RMSE, n = 1) %>% pull(Model)
-best_rmse   <- perf %>% slice_min(RMSE, n = 1) %>% pull(RMSE)
-best_r2     <- perf %>% slice_min(RMSE, n = 1) %>% pull(`R² (test)`)
-rf_beats    <- rf_rmse  < base_rmse
-xgb_beats   <- xgb_rmse < base_rmse
-any_ml_wins <- rf_beats | xgb_beats
+best_model   <- perf %>% slice_min(RMSE, n = 1) %>% pull(Model)
+best_rmse    <- perf %>% slice_min(RMSE, n = 1) %>% pull(RMSE)
+best_r2      <- perf %>% slice_min(RMSE, n = 1) %>% pull(`R² (test)`)
+
+# Best among the six predictor models (linear + regularised + trees)
+pred_tbl     <- tibble(
+  model = c("OLS within", "Lasso", "Ridge", "Elastic Net", "Random Forest", "XGBoost"),
+  rmse  = c(lm_rmse, lasso_rmse, ridge_rmse, enet_rmse, rf_rmse, xgb_rmse),
+  r2    = c(lm_r2,   lasso_r2,   ridge_r2,   enet_r2,   rf_r2,   xgb_r2)
+) %>% arrange(rmse)
+best_pred       <- pred_tbl$model[1]
+best_pred_r2    <- round(pred_tbl$r2[1], 3)
+ml_beats_global <- min(pred_tbl$rmse) < base_rmse   # any predictor model beats naive mean?
+cmean_worse     <- cmean_rmse > base_rmse           # is the FE offset a poor predictor?
 ```
 
-**`r best_model`** achieves the lowest test-set RMSE (`r best_rmse` pp) and the highest $R^2$ (`r best_r2`). `r if(any_ml_wins) paste0("The ensemble methods improve on the mean baseline, capturing non-linear interactions that additive regression misses.") else "Neither ensemble method improves on the mean-prediction baseline on this test set."` This outcome is not surprising: short-run GDP growth is driven heavily by idiosyncratic shocks—geopolitical events, natural disasters, sudden commodity swings—that no lagged macroeconomic regressor can anticipate. The test period (2015–2024) includes the 2020 COVID collapse, which is both the largest single-year shock in the sample and the hardest to predict from prior-year fundamentals.
+The striking result in Table 3 is that **`r best_model`** gives the lowest test-set RMSE (`r best_rmse` pp): `r if(ml_beats_global) "the predictor-based models edge out the naive global mean, but only marginally—every $R^2$ remains close to zero." else "not one of the six predictor models—three regularised linear (Lasso, Ridge, Elastic Net) and two tree ensembles, plus OLS—beats the naive global-mean baseline, and every test $R^2$ is negative."` `r if(cmean_worse) paste0("The country-mean (fixed-effect) benchmark is in fact the *worst* of all, because growth is strongly mean-reverting: a country's 1990--2014 average says little about its 2015--2024 path, so projecting it forward adds error rather than signal.") else "The country-mean benchmark improves on the global mean, reflecting persistent cross-country differences in trend growth."` Among the predictor models the best performer is `r best_pred` (test $R^2$ = `r best_pred_r2`); regularisation (Lasso keeps only `r lasso_nz` of `r length(features)` features) neither helps nor hurts materially, and the flexible ensembles do no better than the linear models. That uniformity across model classes is itself the message: short-run within-country GDP growth is dominated by idiosyncratic shocks—geopolitical events, commodity swings, and above all the 2020 COVID collapse in the test window—that no prior-year macroeconomic regressor can anticipate. This is a genuine finding, not a modelling failure: the within transformation and the lagged AR term remove the easy cross-country variation and lay bare how little of the *year-to-year* movement is forecastable.
+
+## Is it just COVID?
+
+An obvious objection is that the negative $R^2$ values are an artefact of the single, unforecastable 2020 COVID collapse. Table 4 refutes this by recomputing each model's test $R^2$ on three progressively COVID-free subsets.
+
+```{r robust-covid, include=FALSE}
+yr_test <- test_raw$year
+gm_pred    <- rep(mean(train_raw$gdp_growth), length(y_test))
+ridge_pred <- as.numeric(predict(ridge$cvg, newx = X_test, s = "lambda.min")) + test_fe
+
+r2_sub <- function(p, keep) {
+  a <- y_test[keep]; pk <- p[keep]
+  1 - sum((pk - a)^2) / sum((a - mean(a))^2)
+}
+
+subsets <- list(
+  "Full"          = rep(TRUE, length(yr_test)),
+  "Excl. 2020"    = yr_test != 2020,
+  "Excl. 2020-21" = !(yr_test %in% c(2020, 2021)),
+  "2015-19"       = yr_test <= 2019
+)
+robust_models <- list(
+  "Global mean"   = gm_pred,
+  "OLS within"    = lm_pred,
+  "Ridge"         = ridge_pred,
+  "Random Forest" = rf_pred,
+  "XGBoost"       = xgb_pred
+)
+robust_tbl <- lapply(names(robust_models), function(m) {
+  vals <- sapply(subsets, function(k) r2_sub(robust_models[[m]], k))
+  data.frame(Model = m, t(round(vals, 3)), check.names = FALSE)
+}) %>% bind_rows()
+
+ridge_pre <- round(r2_sub(ridge_pred, subsets[["2015-19"]]), 3)
+```
+
+```{r robust-table}
+kbl(robust_tbl, booktabs = TRUE, longtable = FALSE,
+    caption = "Test $R^2$ by sub-period. Removing the 2020 (and 2021) shock does not restore predictability; even the calm 2015--19 window is negative for every model.",
+    escape = FALSE, format = "latex") %>%
+  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
+                full_width = FALSE, font_size = 7.5)
+```
+
+The result is counter-intuitive but decisive: dropping 2020 makes the predictor models *worse*, not better, and even the entirely crisis-free 2015–19 window leaves every $R^2$ negative (Ridge: `r ridge_pre`). The reason is mechanical—in calm years the cross-country spread of growth is narrow, so the variance the model must explain shrinks faster than its errors do, and beating the simple mean becomes even harder; the high-variance 2020 collapse actually *flatters* $R^2$ by enlarging the denominator. COVID is therefore a symptom, not the cause: short-run growth is unforecastable from lagged fundamentals in tranquil and turbulent years alike.
 
 ## Variable importance
 
@@ -494,7 +640,8 @@ feat_labels <- c(
   L_inflation_log = "Inflation (log)",
   L_market_cap    = "Market Cap/GDP",
   L_trade         = "Trade/GDP",
-  L_unemployment  = "Unemployment"
+  L_unemployment  = "Unemployment",
+  L_gdp_growth    = "GDP Growth (L1)"
 )
 
 # RF importance
@@ -533,7 +680,7 @@ top_rf  <- rf_imp_df  %>% slice_max(importance, n = 1)
 top_xgb <- xgb_imp_df %>% slice_max(importance, n = 1)
 ```
 
-Figure 1 shows that **`r top_rf$feature`** is the single most informative predictor in the Random Forest (`r round(top_rf$importance, 1)`% of total impurity reduction), while **`r top_xgb$feature`** leads in XGBoost by gain. The two methods broadly agree on the ranking of the remaining variables: investment and trade openness consistently rank above financial-market indicators, echoing the regression findings in Section 1. Inflation contributes modestly in both models—consistent with the view that its growth effects operate mainly at extremes (hyperinflationary episodes) rather than across the full distribution.
+Figure 1 shows that **`r top_rf$feature`** is by far the single most informative predictor in both models (`r round(top_rf$importance, 1)`% of total impurity reduction in the Random Forest): growth's own persistence dwarfs every macroeconomic regressor. Beyond this autoregressive term, no variable stands out—the remaining importances are small and the two algorithms disagree on their precise order. Once the within transformation strips out fixed cross-country level differences, little systematic *year-to-year* signal remains in the lagged fundamentals, which is exactly why the out-of-sample $R^2$ values in Table 3 sit near or below zero.
 
 ## Predicted vs. actual
 
@@ -690,7 +837,7 @@ kbl(granger_tbl,
 
 # Conclusions
 
-The four analyses in this report converge on a consistent picture. The **panel unit root tests** (Section 2) find that most WDI indicators are stationary in levels over 1990–2024, validating the levels specifications used in Sections 3 and 4. The **two-way fixed-effects regression** (Section 3) confirms conditional convergence, a positive investment-growth link, and a negative inflation effect—all robust to controlling for both country-specific heterogeneity and global time shocks. The **ML ensembles** (Section 3) deliver modest but genuine out-of-sample $R^2$ improvements over OLS, with large errors concentrated in crisis years, confirming that GDP growth is fundamentally hard to forecast from annual macroeconomic fundamentals alone. The **VAR impulse responses** (Section 4) corroborate the regression findings in a fully dynamic framework: an investment shock generates a persistent multi-year growth dividend, an inflation shock produces an initial contraction, and the trade shock effect is small and imprecisely estimated—consistent with the near-zero correlation identified in the EDA.
+The four analyses in this report converge on a consistent picture. The **panel unit root tests** (Section 2) find that most WDI indicators are stationary in levels over 1990–2024, validating the levels specifications used in Sections 3 and 4. The **two-way fixed-effects regression** (Section 3) shows conditional convergence with the expected negative sign, but its most robust finding is a negative, consistently significant coefficient on lagged Credit/GDP; the investment and trade effects, strong in the pooled specification, weaken once country and year fixed effects are added, indicating that much of their apparent explanatory power lies *between* economies rather than within them. The **ML ensembles** (Section 3) tell an equally important negative story: even after a within transformation and a lagged-growth feature, neither random forest nor gradient boosting clears the naive global-mean baseline out-of-sample, and every test $R^2$ is essentially zero or negative. Short-run year-to-year growth is, to first order, unforecastable from prior-year fundamentals. The **VAR impulse responses** (Section 4) add the dynamic dimension: an investment shock generates a persistent multi-year growth dividend, an inflation shock produces an initial contraction, and the trade shock effect is small and imprecisely estimated—consistent with the near-zero correlation identified in the EDA.
 
 Two distributional features dominate all modelling choices. GDP per Capita and Inflation are heavily right-skewed and require log transformation. Financial-depth variables (Credit/GDP, Market Cap/GDP) are disproportionately missing for lower-income economies, so any model including these regressors implicitly conditions on the existence of formal capital markets—a selection that should be made explicit rather than left buried in the sample.
 
