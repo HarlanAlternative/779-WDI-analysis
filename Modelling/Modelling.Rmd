@@ -586,7 +586,7 @@ The striking result in Table 3 is that **`r best_model`** gives the lowest test-
 
 ## Is it just COVID?
 
-An obvious objection is that the negative $R^2$ values are an artefact of the single, unforecastable 2020 COVID collapse. Table 4 refutes this by recomputing each model's test $R^2$ on three progressively COVID-free subsets.
+An obvious objection is that the negative $R^2$ values are an artefact of the single, unforecastable 2020 COVID collapse. Figure 1 refutes this by recomputing each model's test $R^2$ on three progressively COVID-free subsets.
 
 ```{r robust-covid, include=FALSE}
 yr_test <- test_raw$year
@@ -619,12 +619,28 @@ robust_tbl <- lapply(names(robust_models), function(m) {
 ridge_pre <- round(r2_sub(ridge_pred, subsets[["2015-19"]]), 3)
 ```
 
-```{r robust-table}
-kbl(robust_tbl, booktabs = TRUE, longtable = FALSE,
-    caption = "Test $R^2$ by sub-period. Removing the 2020 (and 2021) shock does not restore predictability; even the calm 2015--19 window is negative for every model.",
-    escape = FALSE, format = "latex") %>%
-  kable_styling(latex_options = c("striped", "condensed", "HOLD_position"),
-                full_width = FALSE, font_size = 7.5)
+```{r robust-fig, fig.width = 3.0, fig.height = 2.8, fig.pos = "htbp", fig.env = "figure", fig.cap = "Test $R^2$ by sub-period for five representative models. Progressively removing the COVID shock (left to right) never lifts a model above the break-even line ($R^2 = 0$, dashed); even the crisis-free 2015--19 window stays negative. The high-variance 2020 collapse, far from causing the poor fit, actually flatters $R^2$ by enlarging the variance the model is scored against."}
+robust_long <- robust_tbl %>%
+  pivot_longer(-Model, names_to = "subset", values_to = "r2") %>%
+  mutate(
+    subset = factor(subset,
+                    levels = c("Full", "Excl. 2020", "Excl. 2020-21", "2015-19")),
+    Model  = factor(Model,
+                    levels = c("Global mean", "OLS within", "Ridge",
+                               "Random Forest", "XGBoost"))
+  )
+
+ggplot(robust_long, aes(subset, r2, colour = Model, group = Model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.7) +
+  scale_colour_manual(values = c("grey45", "#e67e22", "#2980b9",
+                                 "#27ae60", "#c0392b")) +
+  scale_y_continuous(labels = label_number(accuracy = 0.1)) +
+  labs(x = NULL, y = expression(Test~italic(R)^2)) +
+  theme_report() +
+  theme(axis.text.x = element_text(angle = 18, hjust = 1, size = 6.5),
+        legend.text = element_text(size = 6.8))
 ```
 
 The result is counter-intuitive but decisive: dropping 2020 makes the predictor models *worse*, not better, and even the entirely crisis-free 2015–19 window leaves every $R^2$ negative (Ridge: `r ridge_pre`). The reason is mechanical—in calm years the cross-country spread of growth is narrow, so the variance the model must explain shrinks faster than its errors do, and beating the simple mean becomes even harder; the high-variance 2020 collapse actually *flatters* $R^2$ by enlarging the denominator. COVID is therefore a symptom, not the cause: short-run growth is unforecastable from lagged fundamentals in tranquil and turbulent years alike.
@@ -680,7 +696,7 @@ top_rf  <- rf_imp_df  %>% slice_max(importance, n = 1)
 top_xgb <- xgb_imp_df %>% slice_max(importance, n = 1)
 ```
 
-Figure 1 shows that **`r top_rf$feature`** is by far the single most informative predictor in both models (`r round(top_rf$importance, 1)`% of total impurity reduction in the Random Forest): growth's own persistence dwarfs every macroeconomic regressor. Beyond this autoregressive term, no variable stands out—the remaining importances are small and the two algorithms disagree on their precise order. Once the within transformation strips out fixed cross-country level differences, little systematic *year-to-year* signal remains in the lagged fundamentals, which is exactly why the out-of-sample $R^2$ values in Table 3 sit near or below zero.
+Figure 2 shows that **`r top_rf$feature`** is by far the single most informative predictor in both models (`r round(top_rf$importance, 1)`% of total impurity reduction in the Random Forest): growth's own persistence dwarfs every macroeconomic regressor. Beyond this autoregressive term, no variable stands out—the remaining importances are small and the two algorithms disagree on their precise order. Once the within transformation strips out fixed cross-country level differences, little systematic *year-to-year* signal remains in the lagged fundamentals, which is exactly why the out-of-sample $R^2$ values in Table 3 sit near or below zero.
 
 ## Predicted vs. actual
 
@@ -713,7 +729,7 @@ p_xgb <- ggplot(pred_df, aes(actual, xgb_pred)) +
 p_rf + p_xgb
 ```
 
-Figure 2 reveals a systematic pattern in both models: the bulk of large errors (red points) occur at the tails of the actual growth distribution—sharp contractions (below $-10$%) and exceptional booms (above $20$%). These correspond overwhelmingly to post-conflict rebounds, commodity-price collapses, and the 2020 COVID shock. Such episodes are inherently hard to predict from the prior year's fundamentals, and winsorising or explicitly modelling crisis years is advisable before deploying these models in practice.
+Figure 3 reveals a systematic pattern in both models: the bulk of large errors (red points) occur at the tails of the actual growth distribution—sharp contractions (below $-10$%) and exceptional booms (above $20$%). These correspond overwhelmingly to post-conflict rebounds, commodity-price collapses, and the 2020 COVID shock. Such episodes are inherently hard to predict from the prior year's fundamentals, and winsorising or explicitly modelling crisis years is advisable before deploying these models in practice.
 
 # VAR Analysis
 
